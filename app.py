@@ -134,11 +134,11 @@ Generate the housekeeping jobs for this booking."""
 
 
 def format_date_for_operandio(date_str):
-    """Convert YYYY-MM-DD to ISO 8601 with timezone for Operandio."""
+    """Return date in YYYY-MM-DD format for Operandio."""
     try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        # Use Australian Eastern time (UTC+10)
-        return dt.strftime("%Y-%m-%dT00:00:00+10:00")
+        # Validate format and return as-is
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
     except (ValueError, TypeError):
         logger.warning(f"Could not parse date: {date_str}, using as-is")
         return date_str
@@ -175,11 +175,10 @@ def create_operandio_job(token, title, content, priority, due_at):
             "title": title,
             "content": content,
             "job": OPERANDIO_JOB_TEMPLATE_ID,
-            "priority": priority,
-            "status": "unresolved",
             "dueAt": formatted_date
         }
     }
+    logger.info(f"GraphQL variables: {variables}")
 
     response = requests.post(
         OPERANDIO_GRAPHQL_URL,
