@@ -110,6 +110,14 @@ Generate the housekeeping jobs for this booking."""
     content = response.json()["content"][0]["text"]
     logger.info(f"Claude response: {content}")
 
+    # Strip markdown code fences if present
+    content = content.strip()
+    if content.startswith("```"):
+        lines = content.split("
+")
+        content = "
+".join(lines[1:-1]).strip()
+
     # Parse JSON response
     jobs = json.loads(content)
     logger.info(f"Successfully parsed Claude response: {jobs}")
