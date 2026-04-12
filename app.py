@@ -159,6 +159,17 @@ def create_operandio_job(token, title, content, priority, due_at):
     }
     """
 
+    # Map Claude priority values to Operandio ActionPriority enum
+    # Valid values: low, normal, high, critical
+    priority_map = {
+        "low": "low",
+        "medium": "normal",
+        "normal": "normal",
+        "high": "high",
+        "critical": "critical"
+    }
+    priority = priority_map.get(priority.lower(), "normal")
+
     variables = {
         "input": {
             "title": title,
