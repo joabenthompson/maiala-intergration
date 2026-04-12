@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: maiala-housekeeping-integration
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPERANDIO_USERNAME
+        sync: false
+      - key: OPERANDIO_PASSWORD
+        sync: false
+      - key: OPERANDIO_JOB_TEMPLATE_ID
+        value: /templates/active/68fff5390c79dcfdc46f0cc1
+      - key: OPERANDIO_GROUP_ID
+        value: /account/groups/6875e9afe3b2fa6732104a84
+      - key: WEBHOOK_SECRET
+        sync: false
