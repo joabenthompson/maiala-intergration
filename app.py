@@ -246,7 +246,7 @@ def handle_checkfront_webhook():
         return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 
-@app.route("/test", methods=["POST"])
+@app.route("/test", methods=["GET", "POST"])
 def test_with_sample():
     """Test endpoint with sample booking data."""
     sample_booking = {
