@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPERANDIO_USERNAME = os.environ.get("OPERANDIO_USERNAME")
 OPERANDIO_PASSWORD = os.environ.get("OPERANDIO_PASSWORD")
-OPERANDIO_JOB_TEMPLATE_ID = os.environ.get("OPERANDIO_JOB_TEMPLATE_ID", "/templates/active/68fff5390c79dcfdc46f0cc1")
-OPERANDIO_GROUP_ID = os.environ.get("OPERANDIO_GROUP_ID", "/account/groups/6875e9afe3b2fa6732104a84")
+OPERANDIO_JOB_TEMPLATE_ID = os.environ.get("OPERANDIO_JOB_TEMPLATE_ID", "68fff5390c79dcfdc46f0cc1")
+OPERANDIO_GROUP_ID = os.environ.get("OPERANDIO_GROUP_ID", "6875e9afe3b2fa6732104a84")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
@@ -183,6 +183,7 @@ def create_operandio_job(token, title, content, priority, due_at):
     )
     if not response.ok:
         logger.error(f"Operandio error {response.status_code}: {response.text}")
+        logger.error(f"Request payload: job={OPERANDIO_JOB_TEMPLATE_ID}, group={OPERANDIO_GROUP_ID}, dueAt={formatted_date}")
     response.raise_for_status()
     result = response.json()
 
