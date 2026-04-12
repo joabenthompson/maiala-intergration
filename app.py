@@ -177,9 +177,7 @@ def create_operandio_job(token, title, content, priority, due_at):
             "job": OPERANDIO_JOB_TEMPLATE_ID,
             "priority": priority,
             "status": "unresolved",
-            "dueAt": formatted_date,
-            "groups": [OPERANDIO_GROUP_ID],
-            "requirePhotoWhenResolving": True
+            "dueAt": formatted_date
         }
     }
 
