@@ -181,6 +181,8 @@ def create_operandio_job(token, title, content, priority, due_at):
         json={"query": mutation, "variables": variables},
         timeout=30
     )
+    if not response.ok:
+        logger.error(f"Operandio error {response.status_code}: {response.text}")
     response.raise_for_status()
     result = response.json()
 
