@@ -1,13 +1,10 @@
 """
-Maiala Park Lodge - Checkfront to Operandio Housekeeping Integration
-Receives Checkfront booking webhooks, uses Claude to generate housekeeping jobs,
-then creates them in Operandio via GraphQL API.
+Maiala Park Lodge - Daily Housekeeping Job Creator
+Runs at 12:01am AEST each day via Render Cron Job.
 
 Flow:
-  1. Receive Checkfront webhook
-  2. Claude generates job titles/content/dates
-  3. For each job: process.run() → get job instance ID
-  4. createJobAction() on that job instance
+  1. Query Checkfront for today's checkouts → create Flip (Checkout) jobs in Operandio
+  2. Query Checkfront for tomorrow's check-ins → create Flip (Pre-Arrival) jobs in Operandio
 """
 
 import os
@@ -15,73 +12,126 @@ import json
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# Checkfront config
+CHECKFRONT_BASE_URL = "https://maiala-park-lodge.checkfront.com/api/3.0"
+CHECKFRONT_API_KEY = os.environ.get("CHECKFRONT_API_KEY", "099b6e052aa288d48f95a2d3f3b0b0fa4b27b47a")
+
+# Operandio config
 OPERANDIO_USERNAME = os.environ.get("OPERANDIO_USERNAME")
 OPERANDIO_PASSWORD = os.environ.get("OPERANDIO_PASSWORD")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 OPERANDIO_AUTH_URL = "https://api.operandio.com/auth/oauth2/token"
 OPERANDIO_GRAPHQL_URL = "https://api.operandio.com/graphql"
 OPERANDIO_LOCATION_ID = "6875e8527e4d972e36fe8073"  # Maiala Park Lodge
 
-# Map cabin names to their Operandio process ID and schedule ID
+# Protect the /run-daily endpoint with a secret
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+AEST = ZoneInfo("Australia/Brisbane")
+
+# Bookings with these statuses are considered active
+ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND"}
+
+# Map Checkfront item names (lowercase) to Operandio process + schedule IDs
 CABIN_MAP = {
-    "kookaburra":         {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835"},
-    "kookaburra suite":   {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835"},
-    "pademelon":          {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1"},
-    "pademelon suite":    {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1"},
-    "echidna":            {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4"},
-    "echidna suite":      {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4"},
-    "cockatoo":           {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde"},
-    "cockatoo suite":     {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde"},
-    "bowerbird":          {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8"},
-    "bowerbird cottage":  {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8"},
+    "kookaburra":        {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835", "label": "Kookaburra Suite"},
+    "kookaburra suite":  {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835", "label": "Kookaburra Suite"},
+    "pademelon":         {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1", "label": "Pademelon Suite"},
+    "pademelon suite":   {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1", "label": "Pademelon Suite"},
+    "echidna":           {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4", "label": "Echidna Suite"},
+    "echidna suite":     {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4", "label": "Echidna Suite"},
+    "cockatoo":          {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde", "label": "Cockatoo Suite"},
+    "cockatoo suite":    {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde", "label": "Cockatoo Suite"},
+    "bowerbird":         {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8", "label": "Bowerbird Cottage"},
+    "bowerbird cottage": {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8", "label": "Bowerbird Cottage"},
 }
 
 DEFAULT_CABIN = CABIN_MAP["bowerbird cottage"]
 
 
-def get_cabin_config(cabin_name):
-    """Return process/schedule IDs for the given cabin name."""
-    if not cabin_name:
-        logger.warning("No cabin name provided, using default")
-        return DEFAULT_CABIN
-    key = cabin_name.strip().lower()
+def get_cabin_config(item_name):
+    """Match a Checkfront item name to an Operandio cabin config."""
+    if not item_name:
+        return None
+    key = item_name.strip().lower()
     if key in CABIN_MAP:
-        logger.info(f"Exact match: '{cabin_name}'")
         return CABIN_MAP[key]
     for cabin_key, config in CABIN_MAP.items():
         if cabin_key in key:
-            logger.info(f"Partial match: '{cabin_name}' matched '{cabin_key}'")
+            logger.info(f"Partial match: '{item_name}' → '{cabin_key}'")
             return config
-    logger.warning(f"No match for cabin '{cabin_name}', using default")
-    return DEFAULT_CABIN
+    logger.warning(f"No cabin match for item '{item_name}'")
+    return None
 
 
-SYSTEM_PROMPT = """You are a housekeeping operations assistant for Maiala Park Lodge in Queensland, Australia.
-When given a Checkfront booking, generate two housekeeping jobs.
-Return ONLY a single flat JSON object with no markdown, no code blocks, no arrays.
-Use exactly these fields:
-- title: checkout clean job title including cabin name e.g. "Checkout Clean - Kookaburra Suite"
-- content: detailed checkout housekeeping instructions based on length of stay and guest count
-- priority: exactly one of: low, medium, high (use high if 4+ nights or 4+ guests)
-- dueAt: checkout date in YYYY-MM-DD format
-- preArrivalTitle: pre-arrival clean job title e.g. "Pre-Arrival Clean - Kookaburra Suite"
-- preArrivalContent: detailed pre-arrival clean instructions to prepare cabin for incoming guests
-- preArrivalDueAt: the day before checkin date in YYYY-MM-DD format"""
+# ---------------------------------------------------------------------------
+# Checkfront
+# ---------------------------------------------------------------------------
 
+def get_checkfront_bookings(date_str, date_field):
+    """
+    Query Checkfront for bookings on a specific date.
+    date_field: 'start_date' (check-in) or 'end_date' (check-out)
+    Returns list of active booking dicts.
+    """
+    logger.info(f"Querying Checkfront: {date_field}={date_str}")
+    response = requests.get(
+        f"{CHECKFRONT_BASE_URL}/booking",
+        headers={"Authorization": f"Token {CHECKFRONT_API_KEY}"},
+        params={
+            date_field: date_str,
+            "status_id": ",".join(ACTIVE_STATUSES),
+            "limit": 100
+        },
+        timeout=30
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    bookings_raw = data.get("booking/index", data.get("booking", {}))
+    if not bookings_raw:
+        logger.info(f"No bookings found for {date_field}={date_str}")
+        return []
+
+    bookings = list(bookings_raw.values()) if isinstance(bookings_raw, dict) else bookings_raw
+    active = [b for b in bookings if b.get("status_id", "") in ACTIVE_STATUSES]
+    logger.info(f"Found {len(active)} active bookings for {date_field}={date_str}")
+    return active
+
+
+def get_booking_detail(booking_id):
+    """Get full booking detail including items/cabin name."""
+    response = requests.get(
+        f"{CHECKFRONT_BASE_URL}/booking/{booking_id}",
+        headers={"Authorization": f"Token {CHECKFRONT_API_KEY}"},
+        timeout=30
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("booking", {})
+
+
+def extract_cabin_from_booking(booking):
+    """Extract cabin name from a Checkfront booking dict."""
+    # Try summary field first
+    summary = booking.get("summary", "")
+    if summary:
+        return summary.split(",")[0].strip()
+    return booking.get("item_name", "")
+
+
+# ---------------------------------------------------------------------------
+# Operandio
+# ---------------------------------------------------------------------------
 
 def get_operandio_token():
     """Get Operandio OAuth bearer token."""
-    logger.info("Getting Operandio auth token...")
     response = requests.post(
         OPERANDIO_AUTH_URL,
         data={"grant_type": "client_credentials"},
@@ -90,337 +140,254 @@ def get_operandio_token():
         timeout=30
     )
     response.raise_for_status()
-    token = response.json().get("access_token")
-    logger.info("Operandio token obtained successfully")
-    return token
+    return response.json().get("access_token")
 
 
-def generate_jobs_with_claude(booking_data):
-    """Use Claude API to generate housekeeping job details from booking data."""
-    logger.info(f"Generating jobs with Claude for booking: {booking_data.get('code', 'unknown')}")
-
-    guest_first = booking_data.get("fields", {}).get("customer_first_name", "")
-    guest_last = booking_data.get("fields", {}).get("customer_last_name", "")
-    guest_name = f"{guest_first} {guest_last}".strip() or booking_data.get("customer_name", "Guest")
-
-    items = booking_data.get("items", [])
-    if isinstance(items, list) and items:
-        cabin = items[0].get("name", "Lodge")
-    else:
-        cabin = booking_data.get("item_name", "Lodge")
-
-    check_in = booking_data.get("checkIn", booking_data.get("start_date", ""))
-    check_out = booking_data.get("checkOut", booking_data.get("end_date", ""))
-    booking_ref = booking_data.get("code", "")
-    guest_count = booking_data.get("slots", booking_data.get("guest_count", ""))
-    notes = booking_data.get("notes", "")
-
-    user_message = f"""New booking received:
-Guest: {guest_name}
-Cabin: {cabin}
-Check-in: {check_in}
-Check-out: {check_out}
-Booking ref: {booking_ref}
-Guest count: {guest_count}
-Guest notes: {notes}
-
-Generate the housekeeping jobs for this booking."""
-
+def graphql(token, query, variables=None):
+    """Execute a GraphQL mutation/query against Operandio."""
     response = requests.post(
-        ANTHROPIC_API_URL,
+        OPERANDIO_GRAPHQL_URL,
         headers={
             "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01"
+            "Authorization": f"Bearer {token}"
         },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 800,
-            "temperature": 0.3,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_message}]
-        },
-        timeout=60
+        json={"query": query, "variables": variables or {}},
+        timeout=30
     )
     response.raise_for_status()
-
-    content = response.json()["content"][0]["text"]
-    logger.info(f"Claude response: {content}")
-
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split(chr(10), 1)[1]
-    if content.strip().endswith("```"):
-        content = content.rsplit("```", 1)[0]
-    content = content.strip()
-    if not content.startswith("{"):
-        start = content.find("{")
-        end = content.rfind("}") + 1
-        if start != -1 and end > start:
-            content = content[start:end]
-
-    jobs = json.loads(content)
-    logger.info(f"Successfully parsed Claude response: {jobs}")
-    return jobs
-
-
-def format_date_for_operandio(date_str):
-    """Return date in YYYY-MM-DD format for Operandio."""
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-        return date_str
-    except (ValueError, TypeError):
-        logger.warning(f"Could not parse date: {date_str}, using as-is")
-        return date_str
+    result = response.json()
+    if "errors" in result:
+        raise Exception(f"GraphQL errors: {result['errors']}")
+    return result["data"]
 
 
 def run_process(token, process_id, schedule_id):
-    """Step 1: Run a process to create a job instance. Returns job instance ID."""
-    logger.info(f"Running process {process_id} with schedule {schedule_id}")
-
-    mutation = """
-    mutation RunProcess($processId: ID!, $scheduleId: ID!, $locationId: ID!) {
-        process(id: $processId) {
-            run(schedule: $scheduleId, location: $locationId) {
-                id
-                processName
+    """Run a process adhoc to create a job instance. Returns job ID."""
+    data = graphql(token, """
+        mutation RunProcess($processId: ID!, $scheduleId: ID!, $locationId: ID!) {
+            process(id: $processId) {
+                run(schedule: $scheduleId, location: $locationId) {
+                    id
+                    processName
+                }
             }
         }
-    }
-    """
-
-    variables = {
+    """, {
         "processId": process_id,
         "scheduleId": schedule_id,
         "locationId": OPERANDIO_LOCATION_ID
-    }
-
-    response = requests.post(
-        OPERANDIO_GRAPHQL_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        },
-        json={"query": mutation, "variables": variables},
-        timeout=30
-    )
-    response.raise_for_status()
-    result = response.json()
-
-    if "errors" in result:
-        raise Exception(f"GraphQL errors running process: {result['errors']}")
-
-    job_id = result["data"]["process"]["run"]["id"]
-    process_name = result["data"]["process"]["run"]["processName"]
-    logger.info(f"Created job instance: {job_id} ({process_name})")
+    })
+    job_id = data["process"]["run"]["id"]
+    logger.info(f"Created job instance: {job_id} ({data['process']['run']['processName']})")
     return job_id
 
 
-def create_operandio_job_action(token, job_instance_id, title, content, priority, due_at):
-    """Step 2: Create a job action on an existing job instance."""
-    logger.info(f"Creating job action '{title}' on job {job_instance_id} due {due_at}")
-
-    formatted_date = format_date_for_operandio(due_at)
-
-    priority_map = {
-        "low": "low",
-        "medium": "normal",
-        "normal": "normal",
-        "high": "high",
-        "critical": "critical"
-    }
-    mapped_priority = priority_map.get(priority.lower(), "normal")
-
-    mutation = """
-    mutation CreateJobAction($input: JobActionInput!) {
-        createJobAction(input: $input) {
-            id
-            title
+def update_job_title(token, job_id, title):
+    """Update the display title of a job instance."""
+    graphql(token, """
+        mutation UpdateJobTitle($jobId: ID!, $title: String!) {
+            job(id: $jobId) {
+                updateTitle(title: $title) {
+                    id
+                    title
+                }
+            }
         }
-    }
+    """, {"jobId": job_id, "title": title})
+    logger.info(f"Set job title: '{title}'")
+
+
+def create_flip_job(token, cabin_config, date_str, job_type, guest_name=""):
     """
+    Create a Flip job for a cabin.
+    job_type: 'Checkout' or 'Pre-Arrival'
+    Returns (job_id, title).
+    """
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        date_label = date_obj.strftime("%-d %B %Y")
+    except Exception:
+        date_label = date_str
 
-    variables = {
-        "input": {
-            "title": title,
-            "content": content,
-            "job": job_instance_id,
-            "priority": mapped_priority,
-            "dueAt": formatted_date
-        }
+    guest_part = f" ({guest_name})" if guest_name else ""
+    title = f"Flip {cabin_config['label']} - {job_type} {date_label}{guest_part}"
+
+    job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
+    update_job_title(token, job_id, title)
+    logger.info(f"Flip job ready: '{title}'")
+    return job_id, title
+
+
+# ---------------------------------------------------------------------------
+# Core daily logic
+# ---------------------------------------------------------------------------
+
+def run_daily_jobs(today_str, tomorrow_str):
+    """
+    Main logic: query Checkfront and create Operandio jobs.
+    Returns a summary dict.
+    """
+    results = {
+        "date": today_str,
+        "checkouts": [],
+        "pre_arrivals": [],
+        "errors": []
     }
 
-    response = requests.post(
-        OPERANDIO_GRAPHQL_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        },
-        json={"query": mutation, "variables": variables},
-        timeout=30
-    )
-    if not response.ok:
-        logger.error(f"Operandio error {response.status_code}: {response.text}")
-    response.raise_for_status()
-    result = response.json()
+    token = get_operandio_token()
+    logger.info(f"Running daily jobs for {today_str} (checkouts) / {tomorrow_str} (pre-arrivals)")
 
-    if "errors" in result:
-        raise Exception(f"GraphQL errors creating job action: {result['errors']}")
+    # --- Checkouts (end_date = today) ---
+    try:
+        checkouts = get_checkfront_bookings(today_str, "end_date")
+        for booking in checkouts:
+            try:
+                booking_id = booking.get("booking_id") or booking.get("code", "")
+                guest_name = booking.get("customer_name", "")
+                cabin_name = extract_cabin_from_booking(booking)
+                cabin_config = get_cabin_config(cabin_name)
 
-    action_id = result["data"]["createJobAction"]["id"]
-    logger.info(f"Created job action: {action_id} - {title}")
-    return action_id
+                if not cabin_config:
+                    logger.warning(f"Skipping booking {booking_id} - unknown cabin: '{cabin_name}'")
+                    results["errors"].append(f"Unknown cabin '{cabin_name}' for booking {booking_id}")
+                    continue
+
+                job_id, title = create_flip_job(
+                    token=token,
+                    cabin_config=cabin_config,
+                    date_str=today_str,
+                    job_type="Checkout",
+                    guest_name=guest_name
+                )
+                results["checkouts"].append({
+                    "booking_id": booking_id,
+                    "cabin": cabin_name,
+                    "guest": guest_name,
+                    "job_id": job_id,
+                    "title": title
+                })
+            except Exception as e:
+                logger.error(f"Error processing checkout booking {booking.get('booking_id')}: {e}")
+                results["errors"].append(str(e))
+    except Exception as e:
+        logger.error(f"Error fetching checkouts: {e}")
+        results["errors"].append(f"Checkout fetch error: {e}")
+
+    # --- Pre-arrivals (start_date = tomorrow) ---
+    try:
+        pre_arrivals = get_checkfront_bookings(tomorrow_str, "start_date")
+        for booking in pre_arrivals:
+            try:
+                booking_id = booking.get("booking_id") or booking.get("code", "")
+                guest_name = booking.get("customer_name", "")
+                cabin_name = extract_cabin_from_booking(booking)
+                cabin_config = get_cabin_config(cabin_name)
+
+                if not cabin_config:
+                    logger.warning(f"Skipping booking {booking_id} - unknown cabin: '{cabin_name}'")
+                    results["errors"].append(f"Unknown cabin '{cabin_name}' for booking {booking_id}")
+                    continue
+
+                job_id, title = create_flip_job(
+                    token=token,
+                    cabin_config=cabin_config,
+                    date_str=tomorrow_str,
+                    job_type="Pre-Arrival",
+                    guest_name=guest_name
+                )
+                results["pre_arrivals"].append({
+                    "booking_id": booking_id,
+                    "cabin": cabin_name,
+                    "guest": guest_name,
+                    "job_id": job_id,
+                    "title": title
+                })
+            except Exception as e:
+                logger.error(f"Error processing pre-arrival booking {booking.get('booking_id')}: {e}")
+                results["errors"].append(str(e))
+    except Exception as e:
+        logger.error(f"Error fetching pre-arrivals: {e}")
+        results["errors"].append(f"Pre-arrival fetch error: {e}")
+
+    return results
 
 
-def create_housekeeping_job(token, cabin_config, title, content, priority, due_at):
-    """Full two-step flow: run process → create job action. Returns action ID."""
-    job_instance_id = run_process(
-        token=token,
-        process_id=cabin_config["process"],
-        schedule_id=cabin_config["schedule"]
-    )
-    action_id = create_operandio_job_action(
-        token=token,
-        job_instance_id=job_instance_id,
-        title=title,
-        content=content,
-        priority=priority,
-        due_at=due_at
-    )
-    return action_id
-
-
-def extract_cabin_name(booking_data):
-    """Extract cabin name from booking data."""
-    items = booking_data.get("items", [])
-    if isinstance(items, list) and items:
-        return items[0].get("name", "")
-    return booking_data.get("item_name", "")
-
+# ---------------------------------------------------------------------------
+# Flask endpoints
+# ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Maiala Park Lodge Integration"})
 
 
-@app.route("/webhook/checkfront", methods=["POST"])
-def handle_checkfront_webhook():
-    """Main webhook handler for Checkfront bookings."""
-    logger.info("Received Checkfront webhook")
+@app.route("/run-daily", methods=["GET", "POST"])
+def run_daily_endpoint():
+    """
+    Called by Render Cron Job at 2:01am UTC (= 12:01am AEST).
+    Protected by CRON_SECRET header.
+    """
+    # Verify secret if configured
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    now_aest = datetime.now(AEST)
+    today_str = now_aest.strftime("%Y-%m-%d")
+    tomorrow_str = (now_aest + timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
-        if request.content_type and "application/json" in request.content_type:
-            booking_data = request.get_json()
-        else:
-            raw_data = request.form.get("payload") or request.data.decode("utf-8")
-            booking_data = json.loads(raw_data)
+        results = run_daily_jobs(today_str, tomorrow_str)
+        total = len(results["checkouts"]) + len(results["pre_arrivals"])
+        logger.info(f"Daily run complete: {total} jobs created, {len(results['errors'])} errors")
+        return jsonify({"success": True, **results}), 200
     except Exception as e:
-        logger.error(f"Failed to parse webhook payload: {e}")
-        return jsonify({"error": "Invalid payload"}), 400
-
-    logger.info(f"Booking data received: {json.dumps(booking_data, indent=2)[:500]}")
-
-    try:
-        cabin_name = extract_cabin_name(booking_data)
-        cabin_config = get_cabin_config(cabin_name)
-        logger.info(f"Cabin '{cabin_name}' → process {cabin_config['process']}")
-
-        jobs = generate_jobs_with_claude(booking_data)
-        token = get_operandio_token()
-
-        checkout_action_id = create_housekeeping_job(
-            token=token,
-            cabin_config=cabin_config,
-            title=jobs["title"],
-            content=jobs["content"],
-            priority=jobs["priority"],
-            due_at=jobs["dueAt"]
-        )
-
-        prearrival_action_id = create_housekeeping_job(
-            token=token,
-            cabin_config=cabin_config,
-            title=jobs["preArrivalTitle"],
-            content=jobs["preArrivalContent"],
-            priority=jobs["priority"],
-            due_at=jobs["preArrivalDueAt"]
-        )
-
-        logger.info(f"Success! checkout={checkout_action_id}, prearrival={prearrival_action_id}")
-
-        return jsonify({
-            "success": True,
-            "cabin": cabin_name,
-            "checkout_action_id": checkout_action_id,
-            "prearrival_action_id": prearrival_action_id,
-            "checkout_title": jobs["title"],
-            "prearrival_title": jobs["preArrivalTitle"]
-        }), 200
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse Claude response as JSON: {e}")
-        return jsonify({"error": "Claude returned invalid JSON", "detail": str(e)}), 500
-    except requests.HTTPError as e:
-        logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
-        return jsonify({"error": "API request failed", "detail": str(e)}), 500
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+        logger.error(f"Daily run failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/test", methods=["GET", "POST"])
-def test_with_sample():
-    """Test endpoint with sample booking data."""
-    cabin_override = request.args.get("cabin", "Kookaburra Suite")
+def test_endpoint():
+    """
+    Test endpoint — pass ?date=YYYY-MM-DD to simulate a specific day,
+    or leave blank to use today AEST.
+    Pass ?dry_run=true to query Checkfront without creating Operandio jobs.
+    """
+    date_param = request.args.get("date")
+    dry_run = request.args.get("dry_run", "false").lower() == "true"
 
-    sample_booking = {
-        "code": "TEST-001",
-        "fields": {
-            "customer_first_name": "Jane",
-            "customer_last_name": "Smith"
-        },
-        "items": [{"name": cabin_override}],
-        "checkIn": "2026-05-29",
-        "checkOut": "2026-05-31",
-        "slots": 2,
-        "notes": "Celebrating anniversary"
-    }
+    if date_param:
+        try:
+            today = datetime.strptime(date_param, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
+    else:
+        today = datetime.now(AEST)
+
+    today_str = today.strftime("%Y-%m-%d")
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if dry_run:
+        # Just show what Checkfront returns without touching Operandio
+        try:
+            checkouts = get_checkfront_bookings(today_str, "end_date")
+            pre_arrivals = get_checkfront_bookings(tomorrow_str, "start_date")
+            return jsonify({
+                "dry_run": True,
+                "today": today_str,
+                "tomorrow": tomorrow_str,
+                "checkouts_found": len(checkouts),
+                "pre_arrivals_found": len(pre_arrivals),
+                "checkouts": checkouts,
+                "pre_arrivals": pre_arrivals
+            }), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     try:
-        cabin_name = extract_cabin_name(sample_booking)
-        cabin_config = get_cabin_config(cabin_name)
-
-        jobs = generate_jobs_with_claude(sample_booking)
-        token = get_operandio_token()
-
-        checkout_action_id = create_housekeeping_job(
-            token=token,
-            cabin_config=cabin_config,
-            title=jobs["title"],
-            content=jobs["content"],
-            priority=jobs["priority"],
-            due_at=jobs["dueAt"]
-        )
-
-        prearrival_action_id = create_housekeeping_job(
-            token=token,
-            cabin_config=cabin_config,
-            title=jobs["preArrivalTitle"],
-            content=jobs["preArrivalContent"],
-            priority=jobs["priority"],
-            due_at=jobs["preArrivalDueAt"]
-        )
-
-        return jsonify({
-            "success": True,
-            "cabin": cabin_name,
-            "process_id": cabin_config["process"],
-            "test_booking": sample_booking,
-            "claude_output": jobs,
-            "checkout_action_id": checkout_action_id,
-            "prearrival_action_id": prearrival_action_id
-        }), 200
-
+        results = run_daily_jobs(today_str, tomorrow_str)
+        return jsonify({"success": True, **results}), 200
     except Exception as e:
         logger.error(f"Test failed: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
