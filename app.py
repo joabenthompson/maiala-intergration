@@ -2,6 +2,12 @@
 Maiala Park Lodge - Checkfront to Operandio Housekeeping Integration
 Receives Checkfront booking webhooks, uses Claude to generate housekeeping jobs,
 then creates them in Operandio via GraphQL API.
+
+Flow:
+  1. Receive Checkfront webhook
+  2. Claude generates job titles/content/dates
+  3. For each job: process.run() → get job instance ID
+  4. createJobAction() on that job instance
 """
 
 import os
@@ -9,7 +15,7 @@ import json
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -19,49 +25,45 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPERANDIO_USERNAME = os.environ.get("OPERANDIO_USERNAME")
 OPERANDIO_PASSWORD = os.environ.get("OPERANDIO_PASSWORD")
-OPERANDIO_GROUP_ID = os.environ.get("OPERANDIO_GROUP_ID", "6875e9afe3b2fa6732104a84")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 OPERANDIO_AUTH_URL = "https://api.operandio.com/auth/oauth2/token"
 OPERANDIO_GRAPHQL_URL = "https://api.operandio.com/graphql"
+OPERANDIO_LOCATION_ID = "6875e8527e4d972e36fe8073"  # Maiala Park Lodge
 
-# Map cabin names (as they appear in Checkfront) to Operandio Flip process IDs
-# Keys are lowercase for case-insensitive matching
-CABIN_PROCESS_MAP = {
-    "kookaburra": "68fff4c0b8d923384331984e",
-    "kookaburra suite": "68fff4c0b8d923384331984e",
-    "pademelon": "68fff4ecf0cdee421c13570a",
-    "pademelon suite": "68fff4ecf0cdee421c13570a",
-    "echidna": "68fff515c1c4d200fadf3b0d",
-    "echidna suite": "68fff515c1c4d200fadf3b0d",
-    "cockatoo": "688f3858ae37bb646c829bf6",
-    "cockatoo suite": "688f3858ae37bb646c829bf6",
-    "bowerbird": "68fff5390c79dcfdc46f0cc1",
-    "bowerbird cottage": "68fff5390c79dcfdc46f0cc1",
+# Map cabin names to their Operandio process ID and schedule ID
+CABIN_MAP = {
+    "kookaburra":         {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835"},
+    "kookaburra suite":   {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835"},
+    "pademelon":          {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1"},
+    "pademelon suite":    {"process": "68fff4ecf0cdee421c13570a", "schedule": "68fff4ecf0cdee421c1356f1"},
+    "echidna":            {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4"},
+    "echidna suite":      {"process": "68fff515c1c4d200fadf3b0d", "schedule": "68fff515c1c4d200fadf3af4"},
+    "cockatoo":           {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde"},
+    "cockatoo suite":     {"process": "688f3858ae37bb646c829bf6", "schedule": "688f3858ae37bb646c829bde"},
+    "bowerbird":          {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8"},
+    "bowerbird cottage":  {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8"},
 }
 
-# Fallback process ID if cabin name doesn't match (Bowerbird as default)
-DEFAULT_PROCESS_ID = "68fff5390c79dcfdc46f0cc1"
+DEFAULT_CABIN = CABIN_MAP["bowerbird cottage"]
 
 
-def get_process_id_for_cabin(cabin_name):
-    """Return the Operandio Flip process ID for the given cabin name."""
+def get_cabin_config(cabin_name):
+    """Return process/schedule IDs for the given cabin name."""
     if not cabin_name:
-        logger.warning("No cabin name provided, using default process ID")
-        return DEFAULT_PROCESS_ID
+        logger.warning("No cabin name provided, using default")
+        return DEFAULT_CABIN
     key = cabin_name.strip().lower()
-    process_id = CABIN_PROCESS_MAP.get(key)
-    if not process_id:
-        # Try partial match — e.g. "Kookaburra Suite (Main)" still matches "kookaburra"
-        for cabin_key, pid in CABIN_PROCESS_MAP.items():
-            if cabin_key in key:
-                logger.info(f"Partial match: '{cabin_name}' matched to '{cabin_key}'")
-                return pid
-        logger.warning(f"No process ID found for cabin '{cabin_name}', using default")
-        return DEFAULT_PROCESS_ID
-    logger.info(f"Matched cabin '{cabin_name}' to process ID {process_id}")
-    return process_id
+    if key in CABIN_MAP:
+        logger.info(f"Exact match: '{cabin_name}'")
+        return CABIN_MAP[key]
+    for cabin_key, config in CABIN_MAP.items():
+        if cabin_key in key:
+            logger.info(f"Partial match: '{cabin_name}' matched '{cabin_key}'")
+            return config
+    logger.warning(f"No match for cabin '{cabin_name}', using default")
+    return DEFAULT_CABIN
 
 
 SYSTEM_PROMPT = """You are a housekeeping operations assistant for Maiala Park Lodge in Queensland, Australia.
@@ -97,12 +99,10 @@ def generate_jobs_with_claude(booking_data):
     """Use Claude API to generate housekeeping job details from booking data."""
     logger.info(f"Generating jobs with Claude for booking: {booking_data.get('code', 'unknown')}")
 
-    # Extract booking fields safely
     guest_first = booking_data.get("fields", {}).get("customer_first_name", "")
     guest_last = booking_data.get("fields", {}).get("customer_last_name", "")
     guest_name = f"{guest_first} {guest_last}".strip() or booking_data.get("customer_name", "Guest")
 
-    # Handle items/cabin name
     items = booking_data.get("items", [])
     if isinstance(items, list) and items:
         cabin = items[0].get("name", "Lodge")
@@ -147,14 +147,12 @@ Generate the housekeeping jobs for this booking."""
     content = response.json()["content"][0]["text"]
     logger.info(f"Claude response: {content}")
 
-    # Strip markdown code fences and extract JSON robustly
     content = content.strip()
     if content.startswith("```"):
         content = content.split(chr(10), 1)[1]
     if content.strip().endswith("```"):
         content = content.rsplit("```", 1)[0]
     content = content.strip()
-
     if not content.startswith("{"):
         start = content.find("{")
         end = content.rfind("}") + 1
@@ -176,11 +174,62 @@ def format_date_for_operandio(date_str):
         return date_str
 
 
-def create_operandio_job(token, title, content, priority, due_at, process_id):
-    """Create a single job in Operandio via GraphQL."""
-    logger.info(f"Creating Operandio job: {title} due {due_at} using process {process_id}")
+def run_process(token, process_id, schedule_id):
+    """Step 1: Run a process to create a job instance. Returns job instance ID."""
+    logger.info(f"Running process {process_id} with schedule {schedule_id}")
+
+    mutation = """
+    mutation RunProcess($processId: ID!, $scheduleId: ID!, $locationId: ID!) {
+        process(id: $processId) {
+            run(schedule: $scheduleId, location: $locationId) {
+                id
+                processName
+            }
+        }
+    }
+    """
+
+    variables = {
+        "processId": process_id,
+        "scheduleId": schedule_id,
+        "locationId": OPERANDIO_LOCATION_ID
+    }
+
+    response = requests.post(
+        OPERANDIO_GRAPHQL_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        },
+        json={"query": mutation, "variables": variables},
+        timeout=30
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    if "errors" in result:
+        raise Exception(f"GraphQL errors running process: {result['errors']}")
+
+    job_id = result["data"]["process"]["run"]["id"]
+    process_name = result["data"]["process"]["run"]["processName"]
+    logger.info(f"Created job instance: {job_id} ({process_name})")
+    return job_id
+
+
+def create_operandio_job_action(token, job_instance_id, title, content, priority, due_at):
+    """Step 2: Create a job action on an existing job instance."""
+    logger.info(f"Creating job action '{title}' on job {job_instance_id} due {due_at}")
 
     formatted_date = format_date_for_operandio(due_at)
+
+    priority_map = {
+        "low": "low",
+        "medium": "normal",
+        "normal": "normal",
+        "high": "high",
+        "critical": "critical"
+    }
+    mapped_priority = priority_map.get(priority.lower(), "normal")
 
     mutation = """
     mutation CreateJobAction($input: JobActionInput!) {
@@ -191,24 +240,15 @@ def create_operandio_job(token, title, content, priority, due_at, process_id):
     }
     """
 
-    priority_map = {
-        "low": "low",
-        "medium": "normal",
-        "normal": "normal",
-        "high": "high",
-        "critical": "critical"
-    }
-    priority = priority_map.get(priority.lower(), "normal")
-
     variables = {
         "input": {
             "title": title,
             "content": content,
-            "job": process_id,
+            "job": job_instance_id,
+            "priority": mapped_priority,
             "dueAt": formatted_date
         }
     }
-    logger.info(f"GraphQL variables: {variables}")
 
     response = requests.post(
         OPERANDIO_GRAPHQL_URL,
@@ -221,16 +261,33 @@ def create_operandio_job(token, title, content, priority, due_at, process_id):
     )
     if not response.ok:
         logger.error(f"Operandio error {response.status_code}: {response.text}")
-        logger.error(f"Request payload: job={process_id}, dueAt={formatted_date}")
     response.raise_for_status()
     result = response.json()
 
     if "errors" in result:
-        raise Exception(f"GraphQL errors: {result['errors']}")
+        raise Exception(f"GraphQL errors creating job action: {result['errors']}")
 
-    job_id = result["data"]["createJobAction"]["id"]
-    logger.info(f"Created Operandio job: {job_id} - {title}")
-    return job_id
+    action_id = result["data"]["createJobAction"]["id"]
+    logger.info(f"Created job action: {action_id} - {title}")
+    return action_id
+
+
+def create_housekeeping_job(token, cabin_config, title, content, priority, due_at):
+    """Full two-step flow: run process → create job action. Returns action ID."""
+    job_instance_id = run_process(
+        token=token,
+        process_id=cabin_config["process"],
+        schedule_id=cabin_config["schedule"]
+    )
+    action_id = create_operandio_job_action(
+        token=token,
+        job_instance_id=job_instance_id,
+        title=title,
+        content=content,
+        priority=priority,
+        due_at=due_at
+    )
+    return action_id
 
 
 def extract_cabin_name(booking_data):
@@ -243,7 +300,6 @@ def extract_cabin_name(booking_data):
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
     return jsonify({"status": "ok", "service": "Maiala Park Lodge Integration"})
 
 
@@ -265,45 +321,38 @@ def handle_checkfront_webhook():
     logger.info(f"Booking data received: {json.dumps(booking_data, indent=2)[:500]}")
 
     try:
-        # Determine which process ID to use based on cabin
         cabin_name = extract_cabin_name(booking_data)
-        process_id = get_process_id_for_cabin(cabin_name)
-        logger.info(f"Using process ID {process_id} for cabin '{cabin_name}'")
+        cabin_config = get_cabin_config(cabin_name)
+        logger.info(f"Cabin '{cabin_name}' → process {cabin_config['process']}")
 
-        # Step 1: Generate jobs with Claude
         jobs = generate_jobs_with_claude(booking_data)
-
-        # Step 2: Get Operandio auth token
         token = get_operandio_token()
 
-        # Step 3: Create checkout clean job
-        checkout_job_id = create_operandio_job(
+        checkout_action_id = create_housekeeping_job(
             token=token,
+            cabin_config=cabin_config,
             title=jobs["title"],
             content=jobs["content"],
             priority=jobs["priority"],
-            due_at=jobs["dueAt"],
-            process_id=process_id
+            due_at=jobs["dueAt"]
         )
 
-        # Step 4: Create pre-arrival clean job
-        prearrival_job_id = create_operandio_job(
+        prearrival_action_id = create_housekeeping_job(
             token=token,
+            cabin_config=cabin_config,
             title=jobs["preArrivalTitle"],
             content=jobs["preArrivalContent"],
             priority=jobs["priority"],
-            due_at=jobs["preArrivalDueAt"],
-            process_id=process_id
+            due_at=jobs["preArrivalDueAt"]
         )
 
-        logger.info(f"Successfully created both jobs: checkout={checkout_job_id}, prearrival={prearrival_job_id}")
+        logger.info(f"Success! checkout={checkout_action_id}, prearrival={prearrival_action_id}")
 
         return jsonify({
             "success": True,
             "cabin": cabin_name,
-            "process_id": process_id,
-            "checkout_job_id": checkout_job_id,
-            "prearrival_job_id": prearrival_job_id,
+            "checkout_action_id": checkout_action_id,
+            "prearrival_action_id": prearrival_action_id,
             "checkout_title": jobs["title"],
             "prearrival_title": jobs["preArrivalTitle"]
         }), 200
@@ -322,7 +371,6 @@ def handle_checkfront_webhook():
 @app.route("/test", methods=["GET", "POST"])
 def test_with_sample():
     """Test endpoint with sample booking data."""
-    # Allow overriding cabin via query param e.g. /test?cabin=Echidna+Suite
     cabin_override = request.args.get("cabin", "Kookaburra Suite")
 
     sample_booking = {
@@ -340,37 +388,37 @@ def test_with_sample():
 
     try:
         cabin_name = extract_cabin_name(sample_booking)
-        process_id = get_process_id_for_cabin(cabin_name)
+        cabin_config = get_cabin_config(cabin_name)
 
         jobs = generate_jobs_with_claude(sample_booking)
         token = get_operandio_token()
 
-        checkout_job_id = create_operandio_job(
+        checkout_action_id = create_housekeeping_job(
             token=token,
+            cabin_config=cabin_config,
             title=jobs["title"],
             content=jobs["content"],
             priority=jobs["priority"],
-            due_at=jobs["dueAt"],
-            process_id=process_id
+            due_at=jobs["dueAt"]
         )
 
-        prearrival_job_id = create_operandio_job(
+        prearrival_action_id = create_housekeeping_job(
             token=token,
+            cabin_config=cabin_config,
             title=jobs["preArrivalTitle"],
             content=jobs["preArrivalContent"],
             priority=jobs["priority"],
-            due_at=jobs["preArrivalDueAt"],
-            process_id=process_id
+            due_at=jobs["preArrivalDueAt"]
         )
 
         return jsonify({
             "success": True,
             "cabin": cabin_name,
-            "process_id": process_id,
+            "process_id": cabin_config["process"],
             "test_booking": sample_booking,
             "claude_output": jobs,
-            "checkout_job_id": checkout_job_id,
-            "prearrival_job_id": prearrival_job_id
+            "checkout_action_id": checkout_action_id,
+            "prearrival_action_id": prearrival_action_id
         }), 200
 
     except Exception as e:
