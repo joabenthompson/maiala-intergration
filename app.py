@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 # Checkfront config
 CHECKFRONT_BASE_URL = "https://maiala-park-lodge.checkfront.com/api/3.0"
-CHECKFRONT_API_KEY = os.environ.get("CHECKFRONT_API_KEY", "099b6e052aa288d48f95a2d3f3b0b0fa4b27b47a")
+CHECKFRONT_API_KEY = os.environ.get("CHECKFRONT_API_KEY", "")
+CHECKFRONT_API_SECRET = os.environ.get("CHECKFRONT_API_SECRET", "")
 
 # Operandio config
 OPERANDIO_USERNAME = os.environ.get("OPERANDIO_USERNAME")
@@ -83,7 +84,7 @@ def get_checkfront_bookings(date_str, date_field):
     logger.info(f"Querying Checkfront: {date_field}={date_str}")
     response = requests.get(
         f"{CHECKFRONT_BASE_URL}/booking",
-        headers={"Authorization": f"Token {CHECKFRONT_API_KEY}"},
+        auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
         params={
             date_field: date_str,
             "status_id": ",".join(ACTIVE_STATUSES),
@@ -109,7 +110,7 @@ def get_booking_detail(booking_id):
     """Get full booking detail including items/cabin name."""
     response = requests.get(
         f"{CHECKFRONT_BASE_URL}/booking/{booking_id}",
-        headers={"Authorization": f"Token {CHECKFRONT_API_KEY}"},
+        auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
         timeout=30
     )
     response.raise_for_status()
