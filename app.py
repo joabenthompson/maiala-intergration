@@ -37,7 +37,9 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 AEST = ZoneInfo("Australia/Brisbane")
 
 # Bookings with these statuses are considered active
-ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND"}
+# PAID = fully paid, PART = deposit paid, HOLD = on hold, PEND = pending
+# OTACC = OTA takes payment, OTAPP = OTA pending payment
+ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND", "OTACC", "OTAPP"}
 
 # Map Checkfront item names (lowercase) to Operandio process + schedule IDs
 CABIN_MAP = {
@@ -87,7 +89,6 @@ def get_checkfront_bookings(date_str, date_field):
         auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
         params={
             date_field: date_str,
-            "status_id": ",".join(ACTIVE_STATUSES),
             "limit": 100
         },
         timeout=30
