@@ -3,16 +3,17 @@ Maiala Park Lodge - Daily Housekeeping Job Creator
 Runs at 12:01am AEST each day via Render Cron Job.
 
 Flow:
-  1. Query Checkfront for today's checkouts → create Flip (Checkout) jobs in Operandio
-  2. Query Checkfront for tomorrow's check-ins → create Flip (Pre-Arrival) jobs in Operandio
+  1. Query Checkfront for today's checkouts (end_date = today)
+  2. For each active booking, create a Flip Checkout job in Operandio
+     for each cabin in the booking, titled
+     "Flip [Cabin] - Checkout [D Month YYYY] ([Guest Name])"
 """
 
 import os
-import json
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -31,7 +32,7 @@ OPERANDIO_AUTH_URL = "https://api.operandio.com/auth/oauth2/token"
 OPERANDIO_GRAPHQL_URL = "https://api.operandio.com/graphql"
 OPERANDIO_LOCATION_ID = "6875e8527e4d972e36fe8073"  # Maiala Park Lodge
 
-# Protect the /run-daily endpoint with a secret
+# Protect /run-daily endpoint with a secret
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 AEST = ZoneInfo("Australia/Brisbane")
@@ -41,7 +42,7 @@ AEST = ZoneInfo("Australia/Brisbane")
 # OTACC = OTA takes payment, OTAPP = OTA pending payment
 ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND", "OTACC", "OTAPP"}
 
-# Map Checkfront item names (lowercase) to Operandio process + schedule IDs
+# Map cabin names (lowercase) to Operandio process + schedule IDs
 CABIN_MAP = {
     "kookaburra":        {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835", "label": "Kookaburra Suite"},
     "kookaburra suite":  {"process": "68fff4c0b8d923384331984e", "schedule": "68fff4c0b8d9233843319835", "label": "Kookaburra Suite"},
@@ -55,42 +56,75 @@ CABIN_MAP = {
     "bowerbird cottage": {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8", "label": "Bowerbird Cottage"},
 }
 
-DEFAULT_CABIN = CABIN_MAP["bowerbird cottage"]
+# Items to explicitly ignore (non-cabin items that appear in booking summaries)
+IGNORE_ITEMS = [
+    "full property hire",
+    "lodge group booking",
+    "gather & feast",
+    "gather and feast",
+]
 
 
-def get_cabin_config(item_name):
-    """Match a Checkfront item name to an Operandio cabin config."""
-    if not item_name:
-        return None
-    key = item_name.strip().lower()
-    if key in CABIN_MAP:
-        return CABIN_MAP[key]
-    for cabin_key, config in CABIN_MAP.items():
-        if cabin_key in key:
-            logger.info(f"Partial match: '{item_name}' → '{cabin_key}'")
-            return config
-    logger.warning(f"No cabin match for item '{item_name}'")
-    return None
+def get_cabin_configs_from_summary(summary):
+    """
+    Parse a Checkfront booking summary (possibly a comma-separated list of items)
+    and return a list of cabin configs for all recognised cabins.
+    """
+    if not summary:
+        return []
+
+    configs = []
+    seen_processes = set()  # dedupe in case the same cabin appears twice
+
+    items = [item.strip() for item in summary.split(",")]
+
+    for item in items:
+        item_lower = item.lower()
+
+        # Skip non-cabin items
+        if any(ignore in item_lower for ignore in IGNORE_ITEMS):
+            logger.info(f"Ignoring non-cabin item: '{item}'")
+            continue
+
+        # Try exact match first
+        if item_lower in CABIN_MAP:
+            config = CABIN_MAP[item_lower]
+            if config["process"] not in seen_processes:
+                configs.append(config)
+                seen_processes.add(config["process"])
+            continue
+
+        # Try partial match (e.g. "Kookaburra Suite (Queen)" contains "kookaburra")
+        matched = False
+        for cabin_key, config in CABIN_MAP.items():
+            if cabin_key in item_lower:
+                if config["process"] not in seen_processes:
+                    logger.info(f"Partial match: '{item}' → '{cabin_key}'")
+                    configs.append(config)
+                    seen_processes.add(config["process"])
+                matched = True
+                break
+
+        if not matched:
+            logger.warning(f"No cabin match for item: '{item}'")
+
+    return configs
 
 
 # ---------------------------------------------------------------------------
 # Checkfront
 # ---------------------------------------------------------------------------
 
-def get_checkfront_bookings(date_str, date_field):
+def get_checkfront_checkouts(date_str):
     """
-    Query Checkfront for bookings on a specific date.
-    date_field: 'start_date' (check-in) or 'end_date' (check-out)
+    Query Checkfront for bookings where end_date = date_str (checkouts).
     Returns list of active booking dicts.
     """
-    logger.info(f"Querying Checkfront: {date_field}={date_str}")
+    logger.info(f"Querying Checkfront for checkouts on {date_str}")
     response = requests.get(
         f"{CHECKFRONT_BASE_URL}/booking",
         auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
-        params={
-            date_field: date_str,
-            "limit": 100
-        },
+        params={"end_date": date_str, "limit": 100},
         timeout=30
     )
     response.raise_for_status()
@@ -98,33 +132,20 @@ def get_checkfront_bookings(date_str, date_field):
 
     bookings_raw = data.get("booking/index", data.get("booking", {}))
     if not bookings_raw:
-        logger.info(f"No bookings found for {date_field}={date_str}")
+        logger.info(f"No bookings found for checkouts on {date_str}")
         return []
 
     bookings = list(bookings_raw.values()) if isinstance(bookings_raw, dict) else bookings_raw
     active = [b for b in bookings if b.get("status_id", "") in ACTIVE_STATUSES]
-    logger.info(f"Found {len(active)} active bookings for {date_field}={date_str}")
+    logger.info(f"Found {len(active)} active checkout bookings (filtered from {len(bookings)} total)")
     return active
 
 
-def get_booking_detail(booking_id):
-    """Get full booking detail including items/cabin name."""
-    response = requests.get(
-        f"{CHECKFRONT_BASE_URL}/booking/{booking_id}",
-        auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
-        timeout=30
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("booking", {})
-
-
-def extract_cabin_from_booking(booking):
-    """Extract cabin name from a Checkfront booking dict."""
-    # Try summary field first
+def extract_cabin_summary(booking):
+    """Extract the summary string (which may list multiple cabins) from a booking."""
     summary = booking.get("summary", "")
     if summary:
-        return summary.split(",")[0].strip()
+        return summary
     return booking.get("item_name", "")
 
 
@@ -199,10 +220,9 @@ def update_job_title(token, job_id, title):
     logger.info(f"Set job title: '{title}'")
 
 
-def create_flip_job(token, cabin_config, date_str, job_type, guest_name=""):
+def create_flip_checkout_job(token, cabin_config, date_str, guest_name=""):
     """
-    Create a Flip job for a cabin.
-    job_type: 'Checkout' or 'Pre-Arrival'
+    Create a Flip Checkout job for a cabin, dated for the checkout day.
     Returns (job_id, title).
     """
     try:
@@ -212,11 +232,11 @@ def create_flip_job(token, cabin_config, date_str, job_type, guest_name=""):
         date_label = date_str
 
     guest_part = f" ({guest_name})" if guest_name else ""
-    title = f"Flip {cabin_config['label']} - {job_type} {date_label}{guest_part}"
+    title = f"Flip {cabin_config['label']} - Checkout {date_label}{guest_part}"
 
     job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
     update_job_title(token, job_id, title)
-    logger.info(f"Flip job ready: '{title}'")
+    logger.info(f"Flip checkout job ready: '{title}'")
     return job_id, title
 
 
@@ -224,92 +244,68 @@ def create_flip_job(token, cabin_config, date_str, job_type, guest_name=""):
 # Core daily logic
 # ---------------------------------------------------------------------------
 
-def run_daily_jobs(today_str, tomorrow_str):
+def run_daily_jobs(today_str):
     """
-    Main logic: query Checkfront and create Operandio jobs.
-    Returns a summary dict.
+    Query Checkfront for today's checkouts and create a Flip Checkout job in
+    Operandio for each cabin in each active booking.
     """
     results = {
         "date": today_str,
         "checkouts": [],
-        "pre_arrivals": [],
         "errors": []
     }
 
     token = get_operandio_token()
-    logger.info(f"Running daily jobs for {today_str} (checkouts) / {tomorrow_str} (pre-arrivals)")
+    logger.info(f"Running daily checkout jobs for {today_str}")
 
-    # --- Checkouts (end_date = today) ---
     try:
-        checkouts = get_checkfront_bookings(today_str, "end_date")
+        checkouts = get_checkfront_checkouts(today_str)
         for booking in checkouts:
             try:
                 booking_id = booking.get("booking_id") or booking.get("code", "")
                 guest_name = booking.get("customer_name", "")
-                cabin_name = extract_cabin_from_booking(booking)
-                cabin_config = get_cabin_config(cabin_name)
+                summary = extract_cabin_summary(booking)
+                cabin_configs = get_cabin_configs_from_summary(summary)
 
-                if not cabin_config:
-                    logger.warning(f"Skipping booking {booking_id} - unknown cabin: '{cabin_name}'")
-                    results["errors"].append(f"Unknown cabin '{cabin_name}' for booking {booking_id}")
+                if not cabin_configs:
+                    logger.warning(
+                        f"Skipping booking {booking_id} - no recognised cabins in summary: '{summary}'"
+                    )
+                    results["errors"].append(
+                        f"No cabins matched for booking {booking_id}: '{summary}'"
+                    )
                     continue
 
-                job_id, title = create_flip_job(
-                    token=token,
-                    cabin_config=cabin_config,
-                    date_str=today_str,
-                    job_type="Checkout",
-                    guest_name=guest_name
-                )
-                results["checkouts"].append({
-                    "booking_id": booking_id,
-                    "cabin": cabin_name,
-                    "guest": guest_name,
-                    "job_id": job_id,
-                    "title": title
-                })
+                for cabin_config in cabin_configs:
+                    try:
+                        job_id, title = create_flip_checkout_job(
+                            token=token,
+                            cabin_config=cabin_config,
+                            date_str=today_str,
+                            guest_name=guest_name
+                        )
+                        results["checkouts"].append({
+                            "booking_id": booking_id,
+                            "cabin": cabin_config["label"],
+                            "guest": guest_name,
+                            "job_id": job_id,
+                            "title": title
+                        })
+                    except Exception as e:
+                        logger.error(
+                            f"Error creating job for booking {booking_id}, "
+                            f"cabin {cabin_config['label']}: {e}"
+                        )
+                        results["errors"].append(
+                            f"Job creation failed for {cabin_config['label']} ({booking_id}): {e}"
+                        )
+
             except Exception as e:
-                logger.error(f"Error processing checkout booking {booking.get('booking_id')}: {e}")
+                logger.error(f"Error processing booking {booking.get('booking_id')}: {e}")
                 results["errors"].append(str(e))
     except Exception as e:
         logger.error(f"Error fetching checkouts: {e}")
         results["errors"].append(f"Checkout fetch error: {e}")
-
-    # --- Pre-arrivals (start_date = tomorrow) ---
-    try:
-        pre_arrivals = get_checkfront_bookings(tomorrow_str, "start_date")
-        for booking in pre_arrivals:
-            try:
-                booking_id = booking.get("booking_id") or booking.get("code", "")
-                guest_name = booking.get("customer_name", "")
-                cabin_name = extract_cabin_from_booking(booking)
-                cabin_config = get_cabin_config(cabin_name)
-
-                if not cabin_config:
-                    logger.warning(f"Skipping booking {booking_id} - unknown cabin: '{cabin_name}'")
-                    results["errors"].append(f"Unknown cabin '{cabin_name}' for booking {booking_id}")
-                    continue
-
-                job_id, title = create_flip_job(
-                    token=token,
-                    cabin_config=cabin_config,
-                    date_str=tomorrow_str,
-                    job_type="Pre-Arrival",
-                    guest_name=guest_name
-                )
-                results["pre_arrivals"].append({
-                    "booking_id": booking_id,
-                    "cabin": cabin_name,
-                    "guest": guest_name,
-                    "job_id": job_id,
-                    "title": title
-                })
-            except Exception as e:
-                logger.error(f"Error processing pre-arrival booking {booking.get('booking_id')}: {e}")
-                results["errors"].append(str(e))
-    except Exception as e:
-        logger.error(f"Error fetching pre-arrivals: {e}")
-        results["errors"].append(f"Pre-arrival fetch error: {e}")
 
     return results
 
@@ -326,10 +322,9 @@ def health():
 @app.route("/run-daily", methods=["GET", "POST"])
 def run_daily_endpoint():
     """
-    Called by Render Cron Job at 2:01am UTC (= 12:01am AEST).
+    Called by Render Cron Job at 2:01pm UTC (= 12:01am AEST).
     Protected by CRON_SECRET header.
     """
-    # Verify secret if configured
     if CRON_SECRET:
         auth = request.headers.get("X-Cron-Secret", "")
         if auth != CRON_SECRET:
@@ -337,12 +332,14 @@ def run_daily_endpoint():
 
     now_aest = datetime.now(AEST)
     today_str = now_aest.strftime("%Y-%m-%d")
-    tomorrow_str = (now_aest + timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
-        results = run_daily_jobs(today_str, tomorrow_str)
-        total = len(results["checkouts"]) + len(results["pre_arrivals"])
-        logger.info(f"Daily run complete: {total} jobs created, {len(results['errors'])} errors")
+        results = run_daily_jobs(today_str)
+        total = len(results["checkouts"])
+        logger.info(
+            f"Daily run complete: {total} checkout jobs created, "
+            f"{len(results['errors'])} errors"
+        )
         return jsonify({"success": True, **results}), 200
     except Exception as e:
         logger.error(f"Daily run failed: {e}", exc_info=True)
@@ -352,7 +349,7 @@ def run_daily_endpoint():
 @app.route("/test", methods=["GET", "POST"])
 def test_endpoint():
     """
-    Test endpoint — pass ?date=YYYY-MM-DD to simulate a specific day,
+    Test endpoint - pass ?date=YYYY-MM-DD to simulate a specific day,
     or leave blank to use today AEST.
     Pass ?dry_run=true to query Checkfront without creating Operandio jobs.
     """
@@ -368,27 +365,33 @@ def test_endpoint():
         today = datetime.now(AEST)
 
     today_str = today.strftime("%Y-%m-%d")
-    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
 
     if dry_run:
-        # Just show what Checkfront returns without touching Operandio
         try:
-            checkouts = get_checkfront_bookings(today_str, "end_date")
-            pre_arrivals = get_checkfront_bookings(tomorrow_str, "start_date")
+            checkouts = get_checkfront_checkouts(today_str)
+            preview = []
+            for b in checkouts:
+                summary = extract_cabin_summary(b)
+                configs = get_cabin_configs_from_summary(summary)
+                preview.append({
+                    "booking_id": b.get("booking_id"),
+                    "code": b.get("code"),
+                    "guest": b.get("customer_name"),
+                    "status": b.get("status_id"),
+                    "summary": summary,
+                    "cabins_matched": [c["label"] for c in configs]
+                })
             return jsonify({
                 "dry_run": True,
-                "today": today_str,
-                "tomorrow": tomorrow_str,
+                "date": today_str,
                 "checkouts_found": len(checkouts),
-                "pre_arrivals_found": len(pre_arrivals),
-                "checkouts": checkouts,
-                "pre_arrivals": pre_arrivals
+                "bookings": preview
             }), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
     try:
-        results = run_daily_jobs(today_str, tomorrow_str)
+        results = run_daily_jobs(today_str)
         return jsonify({"success": True, **results}), 200
     except Exception as e:
         logger.error(f"Test failed: {e}", exc_info=True)
