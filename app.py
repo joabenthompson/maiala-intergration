@@ -115,10 +115,10 @@ def get_cabin_configs_from_summary(summary):
 # Checkfront
 # ---------------------------------------------------------------------------
 
-def get_checkfront_checkouts(date_str):
+def get_checkfront_checkouts(date_str, filter_status=True):
     """
     Query Checkfront for bookings where end_date = date_str (checkouts).
-    Returns list of active booking dicts.
+    Returns list of active booking dicts (or all bookings if filter_status=False).
     """
     logger.info(f"Querying Checkfront for checkouts on {date_str}")
     response = requests.get(
@@ -136,6 +136,8 @@ def get_checkfront_checkouts(date_str):
         return []
 
     bookings = list(bookings_raw.values()) if isinstance(bookings_raw, dict) else bookings_raw
+    if not filter_status:
+        return bookings
     active = [b for b in bookings if b.get("status_id", "") in ACTIVE_STATUSES]
     logger.info(f"Found {len(active)} active checkout bookings (filtered from {len(bookings)} total)")
     return active
@@ -409,6 +411,7 @@ def test_endpoint():
     """
     date_param = request.args.get("date")
     dry_run = request.args.get("dry_run", "false").lower() == "true"
+    show_all = request.args.get("all", "false").lower() == "true"
 
     if date_param:
         try:
@@ -422,7 +425,7 @@ def test_endpoint():
 
     if dry_run:
         try:
-            checkouts = get_checkfront_checkouts(today_str)
+            checkouts = get_checkfront_checkouts(today_str, filter_status=not show_all)
             preview = []
             for b in checkouts:
                 summary = extract_cabin_summary(b)
