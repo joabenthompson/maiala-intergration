@@ -149,6 +149,43 @@ def extract_cabin_summary(booking):
     return booking.get("item_name", "")
 
 
+def get_checkfront_booking_detail(booking_id):
+    """Fetch full booking detail including individual items."""
+    logger.info(f"Fetching full booking detail for {booking_id}")
+    response = requests.get(
+        f"{CHECKFRONT_BASE_URL}/booking/{booking_id}",
+        auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json().get("booking", {})
+
+
+def get_cabin_configs_from_booking_detail(detail):
+    """
+    Parse cabin configs from a full booking's items dict.
+    Used as a fallback when the booking-list summary doesn't yield a cabin match
+    (common with OTA bookings where the summary is the channel name).
+    """
+    items = detail.get("items", {})
+    if not items:
+        return []
+
+    all_configs = []
+    seen = set()
+    item_list = items.values() if isinstance(items, dict) else items
+
+    for item in item_list:
+        item_summary = item.get("summary", "")
+        if item_summary:
+            for config in get_cabin_configs_from_summary(item_summary):
+                if config["process"] not in seen:
+                    all_configs.append(config)
+                    seen.add(config["process"])
+
+    return all_configs
+
+
 # ---------------------------------------------------------------------------
 # Operandio
 # ---------------------------------------------------------------------------
@@ -268,8 +305,25 @@ def run_daily_jobs(today_str):
                 cabin_configs = get_cabin_configs_from_summary(summary)
 
                 if not cabin_configs:
+                    # OTA bookings (e.g. Airbnb) often have the channel name as
+                    # the summary rather than the cabin name. Fall back to fetching
+                    # the full booking detail and reading the items list.
+                    logger.info(
+                        f"No cabin match from summary '{summary}' for booking "
+                        f"{booking_id} — fetching full booking detail"
+                    )
+                    raw_id = booking.get("booking_id")
+                    if raw_id:
+                        try:
+                            detail = get_checkfront_booking_detail(raw_id)
+                            cabin_configs = get_cabin_configs_from_booking_detail(detail)
+                        except Exception as e:
+                            logger.error(f"Failed to fetch detail for booking {booking_id}: {e}")
+
+                if not cabin_configs:
                     logger.warning(
-                        f"Skipping booking {booking_id} - no recognised cabins in summary: '{summary}'"
+                        f"Skipping booking {booking_id} - no recognised cabins in "
+                        f"summary or items: '{summary}'"
                     )
                     results["errors"].append(
                         f"No cabins matched for booking {booking_id}: '{summary}'"
@@ -373,13 +427,24 @@ def test_endpoint():
             for b in checkouts:
                 summary = extract_cabin_summary(b)
                 configs = get_cabin_configs_from_summary(summary)
+                fallback_used = False
+                if not configs:
+                    raw_id = b.get("booking_id")
+                    if raw_id:
+                        try:
+                            detail = get_checkfront_booking_detail(raw_id)
+                            configs = get_cabin_configs_from_booking_detail(detail)
+                            fallback_used = bool(configs)
+                        except Exception:
+                            pass
                 preview.append({
                     "booking_id": b.get("booking_id"),
                     "code": b.get("code"),
                     "guest": b.get("customer_name"),
                     "status": b.get("status_id"),
                     "summary": summary,
-                    "cabins_matched": [c["label"] for c in configs]
+                    "cabins_matched": [c["label"] for c in configs],
+                    "detail_fallback_used": fallback_used
                 })
             return jsonify({
                 "dry_run": True,
