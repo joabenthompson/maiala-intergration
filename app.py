@@ -599,6 +599,75 @@ def test_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug-future", methods=["GET"])
+def debug_future_endpoint():
+    """
+    Diagnostic: shows what Checkfront returns for the future bookings query.
+    Usage: /debug-future?date=YYYY-MM-DD&cabin=echidna
+    """
+    date_param = request.args.get("date")
+    cabin_param = request.args.get("cabin", "").lower()
+
+    if date_param:
+        try:
+            datetime.strptime(date_param, "%Y-%m-%d")
+            date_str = date_param
+        except ValueError:
+            return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
+    else:
+        date_str = datetime.now(AEST).strftime("%Y-%m-%d")
+
+    after_date = datetime.strptime(date_str, "%Y-%m-%d")
+    next_day = (after_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    window_end = (after_date + timedelta(days=365)).strftime("%Y-%m-%d")
+
+    try:
+        response = requests.get(
+            f"{CHECKFRONT_BASE_URL}/booking",
+            auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
+            params={"start_date": next_day, "end_date": window_end, "limit": 100},
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    bookings_raw = data.get("booking/index", data.get("booking", {}))
+    bookings = list(bookings_raw.values()) if isinstance(bookings_raw, dict) else (bookings_raw or [])
+
+    result = []
+    for b in bookings:
+        bsummary = extract_cabin_summary(b)
+        configs = get_cabin_configs_from_summary(bsummary)
+        result.append({
+            "booking_id": b.get("booking_id"),
+            "code": b.get("code"),
+            "status": b.get("status_id"),
+            "start_date": b.get("start_date"),
+            "end_date": b.get("end_date"),
+            "summary": bsummary,
+            "cabins_matched": [c["label"] for c in configs],
+            "active": b.get("status_id", "") in ACTIVE_STATUSES
+        })
+
+    cabin_filtered = []
+    if cabin_param and cabin_param in CABIN_MAP:
+        target = CABIN_MAP[cabin_param]["process"]
+        cabin_filtered = [r for r in result if any(
+            c["process"] == target
+            for c in get_cabin_configs_from_summary(r["summary"])
+        )]
+
+    return jsonify({
+        "query_params": {"start_date": next_day, "end_date": window_end},
+        "total_returned": len(bookings),
+        "bookings": result[:30],
+        "cabin_filter": cabin_param or "none — add ?cabin=echidna to filter",
+        "cabin_matched": cabin_filtered
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
