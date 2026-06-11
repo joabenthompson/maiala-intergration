@@ -56,6 +56,9 @@ CABIN_MAP = {
     "bowerbird cottage": {"process": "68fff5390c79dcfdc46f0cc1", "schedule": "68fff5390c79dcfdc46f0ca8", "label": "Bowerbird Cottage"},
 }
 
+# Cabins that form the "Main House" (used for twin share scope matching)
+MAIN_HOUSE_LABELS = {"Kookaburra Suite", "Pademelon Suite", "Echidna Suite", "Cockatoo Suite"}
+
 # Items to explicitly ignore (non-cabin items that appear in booking summaries)
 IGNORE_ITEMS = [
     "full property hire",
@@ -188,10 +191,41 @@ def get_cabin_configs_from_booking_detail(detail):
     return all_configs
 
 
+def has_twin_share_for_cabin(list_summary, cabin_label):
+    """
+    Return True if list_summary contains a Twin Share Configuration that applies
+    to cabin_label, respecting booking scope:
+      - "Twin Share Configuration - Echidna"       → Echidna Suite only
+      - "Twin Share Configuration - Main House"     → Echidna, Pademelon, Cockatoo, Kookaburra
+      - "All Twin Share Configuration (Full Property)" → all 5 cabins including Bowerbird
+    """
+    cabin_key = cabin_label.lower().split()[0]  # e.g. "echidna" from "Echidna Suite"
+
+    for raw_item in list_summary.split(","):
+        item = raw_item.strip().lower()
+        if "twin share configuration" not in item:
+            continue
+        # Full property → applies to every cabin
+        if "full property" in item or item.startswith("all twin"):
+            return True
+        # Main house → applies only to the four main house cabins
+        if "main house" in item:
+            return cabin_label in MAIN_HOUSE_LABELS
+        # Specific cabin qualifier e.g. "twin share configuration - echidna"
+        if " - " in item:
+            qualifier = item.split(" - ", 1)[1].strip()
+            if cabin_key in qualifier:
+                return True
+            continue  # qualifier names a different cabin — skip
+        # No qualifier → plain "Twin Share Configuration", assume it applies
+        return True
+    return False
+
+
 def get_checkfront_future_bookings(cabin_config, after_date_str):
     """
     Query Checkfront for active bookings in a specific cabin that start after
-    after_date_str (YYYY-MM-DD). Uses a 60-day window. Returns a list of booking
+    after_date_str (YYYY-MM-DD). Uses a 365-day window. Returns a list of booking
     dicts sorted by start_date ascending.
     """
     after_date = datetime.strptime(after_date_str, "%Y-%m-%d")
@@ -296,11 +330,12 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
 
     # Twin share add-ons appear in the list-level booking summary but NOT in the
     # detail's items dict (which only contains cabin/package line items). Use the
-    # list-level summary that was already returned by the future bookings query.
+    # list-level summary that was already returned by the future bookings query,
+    # and check scope (individual cabin / main house / full property) so that a
+    # "Main House" twin share doesn't incorrectly trigger a note for Bowerbird.
     list_summary = extract_cabin_summary(next_booking)
-    has_twin_share = "twin share configuration" in list_summary.lower()
-    if not has_twin_share:
-        logger.info(f"No twin share configuration for next {cabin_config['label']} booking")
+    if not has_twin_share_for_cabin(list_summary, cabin_config["label"]):
+        logger.info(f"No applicable twin share configuration for next {cabin_config['label']} booking")
         return None
 
     days_until = (next_checkin_date - checkout_date).days
