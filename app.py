@@ -690,30 +690,40 @@ def debug_future_endpoint():
             for c in get_cabin_configs_from_summary(r["summary"])
         )]
 
-    # Fetch raw detail for the first cabin-matched booking so we can inspect date formats
-    sample_detail = {}
-    if cabin_filtered:
-        sample_id = cabin_filtered[0].get("booking_id")
-        if sample_id:
-            try:
-                d = get_checkfront_booking_detail(sample_id)
-                sample_detail = {
-                    "booking_id": d.get("booking_id"),
-                    "start_date_raw": d.get("start_date"),
-                    "end_date_raw": d.get("end_date"),
-                    "start_date_parsed": str(_parse_checkfront_date(d.get("start_date"))),
-                    "end_date_parsed": str(_parse_checkfront_date(d.get("end_date"))),
-                }
-            except Exception as e:
-                sample_detail = {"error": str(e)}
+    # Fetch detail for each ACTIVE cabin-matched booking to show real check-in dates
+    cabin_detail_dates = []
+    for b in cabin_filtered:
+        if not b.get("active"):
+            continue
+        bid = b.get("booking_id")
+        try:
+            d = get_checkfront_booking_detail(bid)
+            raw_start = d.get("start_date", "")
+            parsed_start = _parse_checkfront_date(raw_start)
+            items = d.get("items", {})
+            item_list = items.values() if isinstance(items, dict) else (items or [])
+            twin_share_items = [
+                item.get("summary", "")
+                for item in item_list
+                if "twin share configuration" in (item.get("summary", "") or "").lower()
+            ]
+            cabin_detail_dates.append({
+                "booking_id": bid,
+                "code": b.get("code"),
+                "status": b.get("status"),
+                "checkin": str(parsed_start) if parsed_start else None,
+                "summary": b.get("summary"),
+                "twin_share_items": twin_share_items,
+                "has_twin_share": bool(twin_share_items),
+            })
+        except Exception as e:
+            cabin_detail_dates.append({"booking_id": bid, "error": str(e)})
 
     return jsonify({
         "query_params": {"start_date": next_day, "end_date": window_end},
         "total_returned": len(bookings),
-        "bookings": result[:30],
         "cabin_filter": cabin_param or "none — add ?cabin=echidna to filter",
-        "cabin_matched": cabin_filtered,
-        "sample_detail_dates": sample_detail
+        "cabin_active_detail": cabin_detail_dates
     })
 
 
