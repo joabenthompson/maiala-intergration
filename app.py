@@ -228,6 +228,23 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
     return cabin_bookings
 
 
+def _parse_checkfront_date(raw):
+    """Parse a Checkfront date value: unix int, string-encoded unix, YYYY-MM-DD, or YYYYMMDD."""
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw)
+    s = str(raw).strip()
+    if s.isdigit():
+        return datetime.fromtimestamp(int(s))
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
 def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
     """
     Look up the next active booking for cabin_config after checkout_date_str.
@@ -253,11 +270,11 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
             raw = detail.get("start_date", "")
             if not raw:
                 continue
-            checkin = (
-                datetime.fromtimestamp(raw)
-                if isinstance(raw, int)
-                else datetime.strptime(str(raw), "%Y-%m-%d")
-            )
+            # start_date may be an int, a string-encoded unix timestamp, or YYYY-MM-DD / YYYYMMDD
+            checkin = _parse_checkfront_date(raw)
+            if checkin is None:
+                logger.warning(f"Unrecognised start_date format for booking {bid}: {raw!r}")
+                continue
             if checkin > checkout_date:
                 if next_checkin_date is None or checkin < next_checkin_date:
                     next_checkin_date = checkin
@@ -673,12 +690,30 @@ def debug_future_endpoint():
             for c in get_cabin_configs_from_summary(r["summary"])
         )]
 
+    # Fetch raw detail for the first cabin-matched booking so we can inspect date formats
+    sample_detail = {}
+    if cabin_filtered:
+        sample_id = cabin_filtered[0].get("booking_id")
+        if sample_id:
+            try:
+                d = get_checkfront_booking_detail(sample_id)
+                sample_detail = {
+                    "booking_id": d.get("booking_id"),
+                    "start_date_raw": d.get("start_date"),
+                    "end_date_raw": d.get("end_date"),
+                    "start_date_parsed": str(_parse_checkfront_date(d.get("start_date"))),
+                    "end_date_parsed": str(_parse_checkfront_date(d.get("end_date"))),
+                }
+            except Exception as e:
+                sample_detail = {"error": str(e)}
+
     return jsonify({
         "query_params": {"start_date": next_day, "end_date": window_end},
         "total_returned": len(bookings),
         "bookings": result[:30],
         "cabin_filter": cabin_param or "none — add ?cabin=echidna to filter",
-        "cabin_matched": cabin_filtered
+        "cabin_matched": cabin_filtered,
+        "sample_detail_dates": sample_detail
     })
 
 
