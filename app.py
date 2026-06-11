@@ -13,7 +13,7 @@ import os
 import logging
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -188,6 +188,98 @@ def get_cabin_configs_from_booking_detail(detail):
     return all_configs
 
 
+def get_checkfront_future_bookings(cabin_config, after_date_str):
+    """
+    Query Checkfront for active bookings in a specific cabin that start after
+    after_date_str (YYYY-MM-DD). Uses a 365-day window. Returns a list of booking
+    dicts sorted by start_date ascending.
+    """
+    after_date = datetime.strptime(after_date_str, "%Y-%m-%d")
+    next_day = (after_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    window_end = (after_date + timedelta(days=365)).strftime("%Y-%m-%d")
+
+    logger.info(
+        f"Querying Checkfront for future {cabin_config['label']} bookings after {after_date_str}"
+    )
+    response = requests.get(
+        f"{CHECKFRONT_BASE_URL}/booking",
+        auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
+        params={"start_date": next_day, "end_date": window_end, "limit": 100},
+        timeout=30
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    bookings_raw = data.get("booking/index", data.get("booking", {}))
+    if not bookings_raw:
+        return []
+
+    bookings = list(bookings_raw.values()) if isinstance(bookings_raw, dict) else bookings_raw
+    active = [b for b in bookings if b.get("status_id", "") in ACTIVE_STATUSES]
+
+    target_process = cabin_config["process"]
+    cabin_bookings = []
+    for b in active:
+        summary = extract_cabin_summary(b)
+        configs = get_cabin_configs_from_summary(summary)
+        if any(c["process"] == target_process for c in configs):
+            cabin_bookings.append(b)
+
+    def _sort_key(b):
+        raw = b.get("start_date", "")
+        if isinstance(raw, int):
+            return raw
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").timestamp()
+        except Exception:
+            return 0
+
+    cabin_bookings.sort(key=_sort_key)
+    return cabin_bookings
+
+
+def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
+    """
+    Look up the next active booking for cabin_config after checkout_date_str.
+    If it includes a 'Twin Share Configuration' add-on, return the appropriate
+    bed note string. Returns None if no note is needed.
+    """
+    future_bookings = get_checkfront_future_bookings(cabin_config, checkout_date_str)
+    if not future_bookings:
+        return None
+
+    next_booking = future_bookings[0]
+    next_booking_id = next_booking.get("booking_id") or next_booking.get("code", "")
+    logger.info(f"Next booking for {cabin_config['label']}: {next_booking_id}")
+
+    detail = get_checkfront_booking_detail(next_booking_id)
+    items = detail.get("items", {})
+    item_list = items.values() if isinstance(items, dict) else (items or [])
+
+    has_twin_share = any(
+        "twin share configuration" in (item.get("summary", "") or "").lower()
+        for item in item_list
+    )
+    if not has_twin_share:
+        logger.info(f"No twin share configuration in next booking {next_booking_id}")
+        return None
+
+    raw_checkin = detail.get("start_date") or next_booking.get("start_date", "")
+    if isinstance(raw_checkin, int):
+        next_checkin_date = datetime.fromtimestamp(raw_checkin)
+    else:
+        next_checkin_date = datetime.strptime(raw_checkin, "%Y-%m-%d")
+
+    checkout_date = datetime.strptime(checkout_date_str, "%Y-%m-%d")
+    days_until = (next_checkin_date - checkout_date).days
+    checkin_label = next_checkin_date.strftime("%d/%m/%Y")
+
+    if days_until <= 5:
+        return f"Split beds required - {checkin_label}"
+    else:
+        return f"Do not make beds, split beds required - {checkin_label}"
+
+
 # ---------------------------------------------------------------------------
 # Operandio
 # ---------------------------------------------------------------------------
@@ -259,10 +351,26 @@ def update_job_title(token, job_id, title):
     logger.info(f"Set job title: '{title}'")
 
 
-def create_flip_checkout_job(token, cabin_config, date_str, guest_name=""):
+def update_job_description(token, job_id, description):
+    """Update the description field of a job instance."""
+    graphql(token, """
+        mutation UpdateJobDescription($jobId: ID!, $description: String!) {
+            job(id: $jobId) {
+                updateDescription(description: $description) {
+                    id
+                    description
+                }
+            }
+        }
+    """, {"jobId": job_id, "description": description})
+    logger.info(f"Set job description: '{description}'")
+
+
+def create_flip_checkout_job(token, cabin_config, date_str, guest_name="", bed_note=None):
     """
     Create a Flip Checkout job for a cabin, dated for the checkout day.
-    Returns (job_id, title).
+    Optionally sets a job description for bed configuration.
+    Returns (job_id, title, bed_note).
     """
     try:
         date_obj = datetime.strptime(date_str, "%Y-%m-%d")
@@ -275,8 +383,12 @@ def create_flip_checkout_job(token, cabin_config, date_str, guest_name=""):
 
     job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
     update_job_title(token, job_id, title)
-    logger.info(f"Flip checkout job ready: '{title}'")
-    return job_id, title
+
+    if bed_note:
+        update_job_description(token, job_id, bed_note)
+
+    logger.info(f"Flip checkout job ready: '{title}'" + (f" | Note: '{bed_note}'" if bed_note else ""))
+    return job_id, title, bed_note
 
 
 # ---------------------------------------------------------------------------
@@ -334,18 +446,29 @@ def run_daily_jobs(today_str):
 
                 for cabin_config in cabin_configs:
                     try:
-                        job_id, title = create_flip_checkout_job(
+                        bed_note = None
+                        try:
+                            bed_note = get_bed_note_for_next_booking(cabin_config, today_str)
+                        except Exception as bed_err:
+                            logger.warning(
+                                f"Bed note lookup failed for {cabin_config['label']} "
+                                f"(booking {booking_id}): {bed_err} — creating job without note"
+                            )
+
+                        job_id, title, bed_note = create_flip_checkout_job(
                             token=token,
                             cabin_config=cabin_config,
                             date_str=today_str,
-                            guest_name=guest_name
+                            guest_name=guest_name,
+                            bed_note=bed_note
                         )
                         results["checkouts"].append({
                             "booking_id": booking_id,
                             "cabin": cabin_config["label"],
                             "guest": guest_name,
                             "job_id": job_id,
-                            "title": title
+                            "title": title,
+                            "bed_note": bed_note
                         })
                     except Exception as e:
                         logger.error(
@@ -440,6 +563,15 @@ def test_endpoint():
                             fallback_used = bool(configs)
                         except Exception:
                             pass
+                bed_notes_preview = []
+                for cabin_cfg in configs:
+                    note = None
+                    try:
+                        note = get_bed_note_for_next_booking(cabin_cfg, today_str)
+                    except Exception:
+                        note = "lookup_failed"
+                    bed_notes_preview.append({"cabin": cabin_cfg["label"], "bed_note": note})
+
                 preview.append({
                     "booking_id": b.get("booking_id"),
                     "code": b.get("code"),
@@ -447,7 +579,8 @@ def test_endpoint():
                     "status": b.get("status_id"),
                     "summary": summary,
                     "cabins_matched": [c["label"] for c in configs],
-                    "detail_fallback_used": fallback_used
+                    "detail_fallback_used": fallback_used,
+                    "bed_notes": bed_notes_preview
                 })
             return jsonify({
                 "dry_run": True,
