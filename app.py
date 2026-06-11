@@ -191,7 +191,7 @@ def get_cabin_configs_from_booking_detail(detail):
 def get_checkfront_future_bookings(cabin_config, after_date_str):
     """
     Query Checkfront for active bookings in a specific cabin that start after
-    after_date_str (YYYY-MM-DD). Uses a 365-day window. Returns a list of booking
+    after_date_str (YYYY-MM-DD). Uses a 60-day window. Returns a list of booking
     dicts sorted by start_date ascending.
     """
     after_date = datetime.strptime(after_date_str, "%Y-%m-%d")
@@ -262,6 +262,7 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
 
     next_checkin_date = None
     next_detail = None
+    next_booking = None
 
     for booking in future_bookings:
         bid = booking.get("booking_id") or booking.get("code", "")
@@ -279,6 +280,7 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
                 if next_checkin_date is None or checkin < next_checkin_date:
                     next_checkin_date = checkin
                     next_detail = detail
+                    next_booking = booking
         except Exception as e:
             logger.warning(f"Skipping booking {bid} in next-booking search: {e}")
 
@@ -292,12 +294,11 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
         f"Next booking for {cabin_config['label']}: check-in {next_checkin_date.date()}"
     )
 
-    items = next_detail.get("items", {})
-    item_list = items.values() if isinstance(items, dict) else (items or [])
-    has_twin_share = any(
-        "twin share configuration" in (item.get("summary", "") or "").lower()
-        for item in item_list
-    )
+    # Twin share add-ons appear in the list-level booking summary but NOT in the
+    # detail's items dict (which only contains cabin/package line items). Use the
+    # list-level summary that was already returned by the future bookings query.
+    list_summary = extract_cabin_summary(next_booking)
+    has_twin_share = "twin share configuration" in list_summary.lower()
     if not has_twin_share:
         logger.info(f"No twin share configuration for next {cabin_config['label']} booking")
         return None
@@ -700,21 +701,16 @@ def debug_future_endpoint():
             d = get_checkfront_booking_detail(bid)
             raw_start = d.get("start_date", "")
             parsed_start = _parse_checkfront_date(raw_start)
-            items = d.get("items", {})
-            item_list = items.values() if isinstance(items, dict) else (items or [])
-            twin_share_items = [
-                item.get("summary", "")
-                for item in item_list
-                if "twin share configuration" in (item.get("summary", "") or "").lower()
-            ]
+            # Twin share is in the list-level summary, not in detail items
+            list_summary = b.get("summary", "")
+            has_twin_share = "twin share configuration" in list_summary.lower()
             cabin_detail_dates.append({
                 "booking_id": bid,
                 "code": b.get("code"),
                 "status": b.get("status"),
                 "checkin": str(parsed_start) if parsed_start else None,
-                "summary": b.get("summary"),
-                "twin_share_items": twin_share_items,
-                "has_twin_share": bool(twin_share_items),
+                "summary": list_summary,
+                "has_twin_share": has_twin_share,
             })
         except Exception as e:
             cabin_detail_dates.append({"booking_id": bid, "error": str(e)})
