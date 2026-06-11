@@ -196,7 +196,10 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
     """
     after_date = datetime.strptime(after_date_str, "%Y-%m-%d")
     next_day = (after_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    window_end = (after_date + timedelta(days=365)).strftime("%Y-%m-%d")
+    # Use a 60-day window to stay well under Checkfront's 100-result cap.
+    # The full-year window was returning 100 results sorted by booking_id ascending,
+    # which cut off recently-created (high-ID) bookings for near-future stays.
+    window_end = (after_date + timedelta(days=60)).strftime("%Y-%m-%d")
 
     logger.info(
         f"Querying Checkfront for future {cabin_config['label']} bookings after {after_date_str}"
@@ -204,7 +207,7 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
     response = requests.get(
         f"{CHECKFRONT_BASE_URL}/booking",
         auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
-        params={"start_date": next_day, "end_date": window_end, "limit": 500},
+        params={"start_date": next_day, "end_date": window_end, "limit": 100},
         timeout=30
     )
     response.raise_for_status()
@@ -218,14 +221,11 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
     active = [b for b in bookings if b.get("status_id", "") in ACTIVE_STATUSES]
 
     target_process = cabin_config["process"]
-    cabin_bookings = []
-    for b in active:
-        summary = extract_cabin_summary(b)
-        configs = get_cabin_configs_from_summary(summary)
-        if any(c["process"] == target_process for c in configs):
-            cabin_bookings.append(b)
-
-    return cabin_bookings
+    return [
+        b for b in active
+        if any(c["process"] == target_process
+               for c in get_cabin_configs_from_summary(extract_cabin_summary(b)))
+    ]
 
 
 def _parse_checkfront_date(raw):
@@ -650,7 +650,7 @@ def debug_future_endpoint():
 
     after_date = datetime.strptime(date_str, "%Y-%m-%d")
     next_day = (after_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    window_end = (after_date + timedelta(days=365)).strftime("%Y-%m-%d")
+    window_end = (after_date + timedelta(days=60)).strftime("%Y-%m-%d")
 
     try:
         response = requests.get(
