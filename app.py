@@ -204,7 +204,7 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
     response = requests.get(
         f"{CHECKFRONT_BASE_URL}/booking",
         auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
-        params={"start_date": next_day, "end_date": window_end, "limit": 100},
+        params={"start_date": next_day, "end_date": window_end, "limit": 500},
         timeout=30
     )
     response.raise_for_status()
@@ -225,16 +225,6 @@ def get_checkfront_future_bookings(cabin_config, after_date_str):
         if any(c["process"] == target_process for c in configs):
             cabin_bookings.append(b)
 
-    def _sort_key(b):
-        raw = b.get("start_date", "")
-        if isinstance(raw, int):
-            return raw
-        try:
-            return datetime.strptime(raw, "%Y-%m-%d").timestamp()
-        except Exception:
-            return 0
-
-    cabin_bookings.sort(key=_sort_key)
     return cabin_bookings
 
 
@@ -243,34 +233,58 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
     Look up the next active booking for cabin_config after checkout_date_str.
     If it includes a 'Twin Share Configuration' add-on, return the appropriate
     bed note string. Returns None if no note is needed.
+
+    Checkfront's booking list API does not return stay dates, so full detail is
+    fetched for each candidate to find the actual earliest check-in after checkout.
     """
     future_bookings = get_checkfront_future_bookings(cabin_config, checkout_date_str)
     if not future_bookings:
         return None
 
-    next_booking = future_bookings[0]
-    next_booking_id = next_booking.get("booking_id") or next_booking.get("code", "")
-    logger.info(f"Next booking for {cabin_config['label']}: {next_booking_id}")
+    checkout_date = datetime.strptime(checkout_date_str, "%Y-%m-%d")
 
-    detail = get_checkfront_booking_detail(next_booking_id)
-    items = detail.get("items", {})
+    next_checkin_date = None
+    next_detail = None
+
+    for booking in future_bookings:
+        bid = booking.get("booking_id") or booking.get("code", "")
+        try:
+            detail = get_checkfront_booking_detail(bid)
+            raw = detail.get("start_date", "")
+            if not raw:
+                continue
+            checkin = (
+                datetime.fromtimestamp(raw)
+                if isinstance(raw, int)
+                else datetime.strptime(str(raw), "%Y-%m-%d")
+            )
+            if checkin > checkout_date:
+                if next_checkin_date is None or checkin < next_checkin_date:
+                    next_checkin_date = checkin
+                    next_detail = detail
+        except Exception as e:
+            logger.warning(f"Skipping booking {bid} in next-booking search: {e}")
+
+    if not next_detail:
+        logger.info(
+            f"No confirmed future bookings for {cabin_config['label']} after {checkout_date_str}"
+        )
+        return None
+
+    logger.info(
+        f"Next booking for {cabin_config['label']}: check-in {next_checkin_date.date()}"
+    )
+
+    items = next_detail.get("items", {})
     item_list = items.values() if isinstance(items, dict) else (items or [])
-
     has_twin_share = any(
         "twin share configuration" in (item.get("summary", "") or "").lower()
         for item in item_list
     )
     if not has_twin_share:
-        logger.info(f"No twin share configuration in next booking {next_booking_id}")
+        logger.info(f"No twin share configuration for next {cabin_config['label']} booking")
         return None
 
-    raw_checkin = detail.get("start_date") or next_booking.get("start_date", "")
-    if isinstance(raw_checkin, int):
-        next_checkin_date = datetime.fromtimestamp(raw_checkin)
-    else:
-        next_checkin_date = datetime.strptime(raw_checkin, "%Y-%m-%d")
-
-    checkout_date = datetime.strptime(checkout_date_str, "%Y-%m-%d")
     days_until = (next_checkin_date - checkout_date).days
     checkin_label = next_checkin_date.strftime("%d/%m/%Y")
 
