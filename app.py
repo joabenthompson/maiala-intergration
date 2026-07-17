@@ -806,6 +806,26 @@ def debug_items_endpoint():
     return jsonify({"count": len(summary), "items": summary})
 
 
+@app.route("/debug-bed-note", methods=["GET"])
+def debug_bed_note_endpoint():
+    """
+    Temporary diagnostic: calls get_bed_note_for_next_booking directly for a
+    given cabin and checkout date, to validate twin-share note generation
+    against real upcoming bookings without needing an actual checkout that day.
+    Usage: /debug-bed-note?cabin=kookaburra&date=2026-09-27
+    """
+    cabin_param = request.args.get("cabin", "").lower()
+    date_str = request.args.get("date")
+    if cabin_param not in CABIN_MAP or not date_str:
+        return jsonify({"error": "cabin (valid cabin name) and date (YYYY-MM-DD) required"}), 400
+    cabin_config = CABIN_MAP[cabin_param]
+    try:
+        note = get_bed_note_for_next_booking(cabin_config, date_str)
+        return jsonify({"cabin": cabin_config["label"], "date": date_str, "bed_note": note})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/debug-raw", methods=["GET"])
 def debug_raw_endpoint():
     """
