@@ -784,14 +784,20 @@ def debug_items_endpoint():
     if request.args.get("raw") == "true":
         return jsonify(data)
 
-    items_raw = data.get("item/index", data.get("item", {}))
+    items_raw = data.get("items", data.get("item/index", data.get("item", {})))
     items = list(items_raw.values()) if isinstance(items_raw, dict) else (items_raw or [])
+
+    match = request.args.get("match", "").lower()
+    if match:
+        items = [i for i in items if match in (i.get("name") or "").lower()]
+
     summary = [
         {
             "id": i.get("item_id") or i.get("id"),
             "name": i.get("name"),
             "sku": i.get("sku"),
             "category_id": i.get("category_id"),
+            "category": i.get("category"),
         }
         for i in items
     ]
