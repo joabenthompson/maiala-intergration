@@ -758,6 +758,43 @@ def debug_future_endpoint():
     })
 
 
+@app.route("/debug-create-test-job", methods=["POST"])
+def debug_create_test_job_endpoint():
+    """
+    Temporary diagnostic: creates ONE real Operandio job, clearly labelled as a
+    test, using the real bed-note note-generation logic for a given cabin/date.
+    Used to confirm the description field actually persists/displays in
+    Operandio. Protected by CRON_SECRET like /run-daily. Delete the resulting
+    job in Operandio manually afterwards.
+    Usage: POST /debug-create-test-job?cabin=kookaburra&date=2026-09-27
+    Header: X-Cron-Secret: <secret>
+    """
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    cabin_param = request.args.get("cabin", "").lower()
+    date_str = request.args.get("date")
+    if cabin_param not in CABIN_MAP or not date_str:
+        return jsonify({"error": "cabin (valid cabin name) and date (YYYY-MM-DD) required"}), 400
+
+    cabin_config = CABIN_MAP[cabin_param]
+    try:
+        bed_note = get_bed_note_for_next_booking(cabin_config, date_str)
+        token = get_operandio_token()
+        job_id, title, note = create_flip_checkout_job(
+            token=token,
+            cabin_config=cabin_config,
+            date_str=date_str,
+            guest_name="TEST JOB - PLEASE DELETE",
+            bed_note=bed_note
+        )
+        return jsonify({"job_id": job_id, "title": title, "bed_note": note})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/debug-bed-note", methods=["GET"])
 def debug_bed_note_endpoint():
     """
