@@ -758,54 +758,6 @@ def debug_future_endpoint():
     })
 
 
-@app.route("/debug-items", methods=["GET"])
-def debug_items_endpoint():
-    """
-    Temporary diagnostic: lists Checkfront catalog items, optionally filtered
-    by category_id, to confirm exact bed-configuration item naming.
-    Usage: /debug-items or /debug-items?category_id=19
-    """
-    category_id = request.args.get("category_id")
-    item_id = request.args.get("item_id")
-    params = {"limit": 100}
-    if category_id:
-        params["category_id"] = category_id
-    try:
-        url = f"{CHECKFRONT_BASE_URL}/item/{item_id}" if item_id else f"{CHECKFRONT_BASE_URL}/item"
-        response = requests.get(
-            url,
-            auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
-            params=params,
-            timeout=30
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    if request.args.get("raw") == "true" or item_id:
-        return jsonify(data)
-
-    items_raw = data.get("items", data.get("item/index", data.get("item", {})))
-    items = list(items_raw.values()) if isinstance(items_raw, dict) else (items_raw or [])
-
-    match = request.args.get("match", "").lower()
-    if match:
-        items = [i for i in items if match in (i.get("name") or "").lower()]
-
-    summary = [
-        {
-            "id": i.get("item_id") or i.get("id"),
-            "name": i.get("name"),
-            "sku": i.get("sku"),
-            "category_id": i.get("category_id"),
-            "category": i.get("category"),
-        }
-        for i in items
-    ]
-    return jsonify({"count": len(summary), "items": summary})
-
-
 @app.route("/debug-bed-note", methods=["GET"])
 def debug_bed_note_endpoint():
     """
@@ -822,23 +774,6 @@ def debug_bed_note_endpoint():
     try:
         note = get_bed_note_for_next_booking(cabin_config, date_str)
         return jsonify({"cabin": cabin_config["label"], "date": date_str, "bed_note": note})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-raw", methods=["GET"])
-def debug_raw_endpoint():
-    """
-    Temporary diagnostic: returns the raw Checkfront booking detail JSON
-    for a given booking_id, to confirm exact item naming/format.
-    Usage: /debug-raw?booking_id=1397
-    """
-    booking_id = request.args.get("booking_id")
-    if not booking_id:
-        return jsonify({"error": "booking_id required"}), 400
-    try:
-        detail = get_checkfront_booking_detail(booking_id)
-        return jsonify(detail)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
