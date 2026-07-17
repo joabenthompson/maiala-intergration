@@ -766,12 +766,14 @@ def debug_items_endpoint():
     Usage: /debug-items or /debug-items?category_id=19
     """
     category_id = request.args.get("category_id")
+    item_id = request.args.get("item_id")
     params = {"limit": 100}
     if category_id:
         params["category_id"] = category_id
     try:
+        url = f"{CHECKFRONT_BASE_URL}/item/{item_id}" if item_id else f"{CHECKFRONT_BASE_URL}/item"
         response = requests.get(
-            f"{CHECKFRONT_BASE_URL}/item",
+            url,
             auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
             params=params,
             timeout=30
@@ -781,7 +783,7 @@ def debug_items_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    if request.args.get("raw") == "true":
+    if request.args.get("raw") == "true" or item_id:
         return jsonify(data)
 
     items_raw = data.get("items", data.get("item/index", data.get("item", {})))
