@@ -758,6 +758,23 @@ def debug_future_endpoint():
     })
 
 
+@app.route("/debug-raw", methods=["GET"])
+def debug_raw_endpoint():
+    """
+    Temporary diagnostic: returns the raw Checkfront booking detail JSON
+    for a given booking_id, to confirm exact item naming/format.
+    Usage: /debug-raw?booking_id=1397
+    """
+    booking_id = request.args.get("booking_id")
+    if not booking_id:
+        return jsonify({"error": "booking_id required"}), 400
+    try:
+        detail = get_checkfront_booking_detail(booking_id)
+        return jsonify(detail)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
