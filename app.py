@@ -781,6 +781,9 @@ def debug_items_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    if request.args.get("raw") == "true":
+        return jsonify(data)
+
     items_raw = data.get("item/index", data.get("item", {}))
     items = list(items_raw.values()) if isinstance(items_raw, dict) else (items_raw or [])
     summary = [
