@@ -758,6 +758,43 @@ def debug_future_endpoint():
     })
 
 
+@app.route("/debug-items", methods=["GET"])
+def debug_items_endpoint():
+    """
+    Temporary diagnostic: lists Checkfront catalog items, optionally filtered
+    by category_id, to confirm exact bed-configuration item naming.
+    Usage: /debug-items or /debug-items?category_id=19
+    """
+    category_id = request.args.get("category_id")
+    params = {"limit": 100}
+    if category_id:
+        params["category_id"] = category_id
+    try:
+        response = requests.get(
+            f"{CHECKFRONT_BASE_URL}/item",
+            auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
+            params=params,
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    items_raw = data.get("item/index", data.get("item", {}))
+    items = list(items_raw.values()) if isinstance(items_raw, dict) else (items_raw or [])
+    summary = [
+        {
+            "id": i.get("item_id") or i.get("id"),
+            "name": i.get("name"),
+            "sku": i.get("sku"),
+            "category_id": i.get("category_id"),
+        }
+        for i in items
+    ]
+    return jsonify({"count": len(summary), "items": summary})
+
+
 @app.route("/debug-raw", methods=["GET"])
 def debug_raw_endpoint():
     """
