@@ -758,6 +758,41 @@ def debug_future_endpoint():
     })
 
 
+@app.route("/debug-schema", methods=["GET"])
+def debug_schema_endpoint():
+    """
+    Temporary diagnostic: introspects the Operandio GraphQL schema to find the
+    real mutation/field for setting a job's description/notes, since our
+    UpdateJobDescription mutation returns a 400 (schema mismatch).
+    Usage: /debug-schema?type=JobMutations  (defaults to JobMutations)
+    Header: X-Cron-Secret: <secret>
+    """
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    type_name = request.args.get("type", "JobMutations")
+    try:
+        token = get_operandio_token()
+        data = graphql(token, """
+            query IntrospectType($name: String!) {
+                __type(name: $name) {
+                    name
+                    kind
+                    fields {
+                        name
+                        args { name type { name kind ofType { name kind } } }
+                        type { name kind ofType { name kind } }
+                    }
+                }
+            }
+        """, {"name": type_name})
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/debug-create-test-job", methods=["POST"])
 def debug_create_test_job_endpoint():
     """
