@@ -375,7 +375,8 @@ def graphql(token, query, variables=None):
         json={"query": query, "variables": variables or {}},
         timeout=30
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise Exception(f"HTTP {response.status_code} from Operandio: {response.text}")
     result = response.json()
     if "errors" in result:
         raise Exception(f"GraphQL errors: {result['errors']}")
