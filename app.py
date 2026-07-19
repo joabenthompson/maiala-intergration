@@ -759,28 +759,28 @@ def debug_future_endpoint():
     })
 
 
-DESCRIPTION_FIELD_CANDIDATES = {
-    "updateNotes": "notes",
-    "updateNote": "note",
-    "updateInstructions": "instructions",
-    "updateComment": "comment",
-    "updateComments": "comments",
-    "updateDetails": "details",
-    "updateBody": "body",
-    "updateText": "text",
-    "updateSummary": "summary",
-    "setDescription": "description",
-    "setNotes": "notes",
-}
+DEFAULT_PROBE_FRAGMENTS = [
+    "job(id: $jobId) { updateNotes(notes: $value) { id } }",
+    "job(id: $jobId) { updateInstructions(instructions: $value) { id } }",
+    "job(id: $jobId) { updateComment(comment: $value) { id } }",
+    "job(id: $jobId) { updateDetails(details: $value) { id } }",
+    "job(id: $jobId) { update(input: { description: $value }) { id } }",
+    "job(id: $jobId) { update(input: { notes: $value }) { id } }",
+    "job(id: $jobId) { updateDescription(input: { description: $value }) { id } }",
+    "addNote(jobId: $jobId, text: $value) { id }",
+    "addNote(jobId: $jobId, note: $value) { id }",
+    "createJobNote(jobId: $jobId, text: $value) { id }",
+]
 
 
 @app.route("/debug-probe-description-field", methods=["POST"])
 def debug_probe_description_field_endpoint():
     """
-    Temporary diagnostic: tries a fixed whitelist of likely job-description
-    field names against Operandio's real JobMutation type (introspection is
-    disabled in prod, so we can't just ask). Reports which ones the schema
-    accepts, without needing a redeploy per guess.
+    Temporary diagnostic: tries a whitelist of likely job-description GraphQL
+    fragments against Operandio's real schema (introspection is disabled in
+    prod, so we can't just ask). Reports which ones the schema accepts.
+    Optionally pass a JSON body {"fragments": ["job(id: $jobId) { ... } }"]}
+    to try custom fragments without redeploying.
     Usage: POST /debug-probe-description-field?job_id=<real job id>
     Header: X-Cron-Secret: <secret>
     """
@@ -793,6 +793,9 @@ def debug_probe_description_field_endpoint():
     if not job_id:
         return jsonify({"error": "job_id required (use an existing test job's id)"}), 400
 
+    body = request.get_json(silent=True) or {}
+    fragments = body.get("fragments") or DEFAULT_PROBE_FRAGMENTS
+
     test_value = "PROBE - please ignore"
     results = {}
     try:
@@ -800,22 +803,17 @@ def debug_probe_description_field_endpoint():
     except Exception as e:
         return jsonify({"error": f"auth failed: {e}"}), 500
 
-    for field, arg in DESCRIPTION_FIELD_CANDIDATES.items():
+    for fragment in fragments:
         query = f"""
             mutation Probe($jobId: ID!, $value: String!) {{
-                job(id: $jobId) {{
-                    {field}({arg}: $value) {{
-                        id
-                    }}
-                }}
+                {fragment}
             }}
         """
         try:
             graphql(token, query, {"jobId": job_id, "value": test_value})
-            results[field] = "SUCCESS"
+            results[fragment] = "SUCCESS"
         except Exception as e:
-            msg = str(e)
-            results[field] = msg[:200]
+            results[fragment] = str(e)[:250]
 
     return jsonify({"job_id": job_id, "results": results})
 
