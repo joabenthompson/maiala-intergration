@@ -810,8 +810,8 @@ def debug_probe_description_field_endpoint():
             }}
         """
         try:
-            graphql(token, query, {"jobId": job_id, "value": test_value})
-            results[fragment] = "SUCCESS"
+            data = graphql(token, query, {"jobId": job_id, "value": test_value})
+            results[fragment] = {"success": True, "data": data}
         except Exception as e:
             results[fragment] = str(e)
 
