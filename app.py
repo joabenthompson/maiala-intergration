@@ -419,30 +419,13 @@ def update_job_title(token, job_id, title):
     logger.info(f"Set job title: '{title}'")
 
 
-def update_job_description(token, job_id, description):
-    """
-    Add a bed-configuration note to a job instance as a JobAction.
-    Operandio's schema has no direct job.updateDescription mutation - notes
-    are added via the top-level createJobAction(input: JobActionInput!)
-    mutation, which requires a "job" ID and a "title", with the actual note
-    text going in "content".
-    """
-    graphql(token, """
-        mutation CreateJobAction($jobId: ID!, $content: String!) {
-            createJobAction(input: { job: $jobId, title: "Bed Configuration Note", content: $content }) {
-                id
-                title
-                content
-            }
-        }
-    """, {"jobId": job_id, "content": description})
-    logger.info(f"Set job note: '{description}'")
-
-
 def create_flip_checkout_job(token, cabin_config, date_str, guest_name="", bed_note=None):
     """
     Create a Flip Checkout job for a cabin, dated for the checkout day.
-    Optionally sets a job description for bed configuration.
+    Operandio has no job field that reliably surfaces to housekeeping other
+    than the title (job.updateDescription doesn't exist in its schema, and
+    createJobAction only writes to an internal activity log staff never see)
+    so any bed-configuration note is folded directly into the title instead.
     Returns (job_id, title, bed_note).
     """
     try:
@@ -453,14 +436,13 @@ def create_flip_checkout_job(token, cabin_config, date_str, guest_name="", bed_n
 
     guest_part = f" ({guest_name})" if guest_name else ""
     title = f"Flip {cabin_config['label']} - Checkout {date_label}{guest_part}"
+    if bed_note:
+        title += f" — {bed_note}"
 
     job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
     update_job_title(token, job_id, title)
 
-    if bed_note:
-        update_job_description(token, job_id, bed_note)
-
-    logger.info(f"Flip checkout job ready: '{title}'" + (f" | Note: '{bed_note}'" if bed_note else ""))
+    logger.info(f"Flip checkout job ready: '{title}'")
     return job_id, title, bed_note
 
 
@@ -764,108 +746,13 @@ def debug_future_endpoint():
     })
 
 
-DEFAULT_PROBE_FRAGMENTS = [
-    "job(id: $jobId) { updateNotes(notes: $value) { id } }",
-    "job(id: $jobId) { updateInstructions(instructions: $value) { id } }",
-    "job(id: $jobId) { updateComment(comment: $value) { id } }",
-    "job(id: $jobId) { updateDetails(details: $value) { id } }",
-    "job(id: $jobId) { update(input: { description: $value }) { id } }",
-    "job(id: $jobId) { update(input: { notes: $value }) { id } }",
-    "job(id: $jobId) { updateDescription(input: { description: $value }) { id } }",
-    "addNote(jobId: $jobId, text: $value) { id }",
-    "addNote(jobId: $jobId, note: $value) { id }",
-    "createJobNote(jobId: $jobId, text: $value) { id }",
-]
-
-
-@app.route("/debug-probe-description-field", methods=["POST"])
-def debug_probe_description_field_endpoint():
-    """
-    Temporary diagnostic: tries a whitelist of likely job-description GraphQL
-    fragments against Operandio's real schema (introspection is disabled in
-    prod, so we can't just ask). Reports which ones the schema accepts.
-    Optionally pass a JSON body {"fragments": ["job(id: $jobId) { ... } }"]}
-    to try custom fragments without redeploying.
-    Usage: POST /debug-probe-description-field?job_id=<real job id>
-    Header: X-Cron-Secret: <secret>
-    """
-    if CRON_SECRET:
-        auth = request.headers.get("X-Cron-Secret", "")
-        if auth != CRON_SECRET:
-            return jsonify({"error": "Unauthorized"}), 401
-
-    job_id = request.args.get("job_id")
-    if not job_id:
-        return jsonify({"error": "job_id required (use an existing test job's id)"}), 400
-
-    body = request.get_json(silent=True) or {}
-    fragments = body.get("fragments") or DEFAULT_PROBE_FRAGMENTS
-
-    test_value = "PROBE - please ignore"
-    results = {}
-    try:
-        token = get_operandio_token()
-    except Exception as e:
-        return jsonify({"error": f"auth failed: {e}"}), 500
-
-    for fragment in fragments:
-        query = f"""
-            mutation Probe($jobId: ID!, $value: String!) {{
-                {fragment}
-            }}
-        """
-        try:
-            data = graphql(token, query, {"jobId": job_id, "value": test_value})
-            results[fragment] = {"success": True, "data": data}
-        except Exception as e:
-            results[fragment] = str(e)
-
-    return jsonify({"job_id": job_id, "results": results})
-
-
-@app.route("/debug-schema", methods=["GET"])
-def debug_schema_endpoint():
-    """
-    Temporary diagnostic: introspects the Operandio GraphQL schema to find the
-    real mutation/field for setting a job's description/notes, since our
-    UpdateJobDescription mutation returns a 400 (schema mismatch).
-    Usage: /debug-schema?type=JobMutations  (defaults to JobMutations)
-    Header: X-Cron-Secret: <secret>
-    """
-    if CRON_SECRET:
-        auth = request.headers.get("X-Cron-Secret", "")
-        if auth != CRON_SECRET:
-            return jsonify({"error": "Unauthorized"}), 401
-
-    type_name = request.args.get("type", "JobMutations")
-    try:
-        token = get_operandio_token()
-        data = graphql(token, """
-            query IntrospectType($name: String!) {
-                __type(name: $name) {
-                    name
-                    kind
-                    fields {
-                        name
-                        args { name type { name kind ofType { name kind } } }
-                        type { name kind ofType { name kind } }
-                    }
-                }
-            }
-        """, {"name": type_name})
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/debug-create-test-job", methods=["POST"])
 def debug_create_test_job_endpoint():
     """
-    Temporary diagnostic: creates ONE real Operandio job, clearly labelled as a
-    test, using the real bed-note note-generation logic for a given cabin/date.
-    Used to confirm the description field actually persists/displays in
-    Operandio. Protected by CRON_SECRET like /run-daily. Delete the resulting
-    job in Operandio manually afterwards.
+    Diagnostic: creates ONE real Operandio job, clearly labelled as a test,
+    using the real job-creation flow (bed note folded into title). Protected
+    by CRON_SECRET like /run-daily. Delete the resulting job in Operandio
+    manually afterwards.
     Usage: POST /debug-create-test-job?cabin=kookaburra&date=2026-09-27
     Header: X-Cron-Secret: <secret>
     """
@@ -881,27 +768,15 @@ def debug_create_test_job_endpoint():
 
     cabin_config = CABIN_MAP[cabin_param]
     try:
-        bed_note = get_bed_note_for_next_booking(cabin_config, date_str)
         token = get_operandio_token()
-        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-        title = f"Flip {cabin_config['label']} - Checkout {date_obj.strftime('%-d %B %Y')} (TEST JOB - PLEASE DELETE)"
-
-        job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
-        update_job_title(token, job_id, title)
-
-        description_error = None
-        if bed_note:
-            try:
-                update_job_description(token, job_id, bed_note)
-            except Exception as e:
-                description_error = str(e)
-
-        return jsonify({
-            "job_id": job_id,
-            "title": title,
-            "bed_note": bed_note,
-            "description_write_error": description_error
-        })
+        job_id, title, bed_note = create_flip_checkout_job(
+            token=token,
+            cabin_config=cabin_config,
+            date_str=date_str,
+            guest_name="TEST JOB - PLEASE DELETE",
+            bed_note=get_bed_note_for_next_booking(cabin_config, date_str)
+        )
+        return jsonify({"job_id": job_id, "title": title, "bed_note": bed_note})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
