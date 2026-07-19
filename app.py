@@ -880,14 +880,25 @@ def debug_create_test_job_endpoint():
     try:
         bed_note = get_bed_note_for_next_booking(cabin_config, date_str)
         token = get_operandio_token()
-        job_id, title, note = create_flip_checkout_job(
-            token=token,
-            cabin_config=cabin_config,
-            date_str=date_str,
-            guest_name="TEST JOB - PLEASE DELETE",
-            bed_note=bed_note
-        )
-        return jsonify({"job_id": job_id, "title": title, "bed_note": note})
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        title = f"Flip {cabin_config['label']} - Checkout {date_obj.strftime('%-d %B %Y')} (TEST JOB - PLEASE DELETE)"
+
+        job_id = run_process(token, cabin_config["process"], cabin_config["schedule"])
+        update_job_title(token, job_id, title)
+
+        description_error = None
+        if bed_note:
+            try:
+                update_job_description(token, job_id, bed_note)
+            except Exception as e:
+                description_error = str(e)
+
+        return jsonify({
+            "job_id": job_id,
+            "title": title,
+            "bed_note": bed_note,
+            "description_write_error": description_error
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
