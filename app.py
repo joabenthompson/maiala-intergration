@@ -420,18 +420,23 @@ def update_job_title(token, job_id, title):
 
 
 def update_job_description(token, job_id, description):
-    """Update the description field of a job instance."""
+    """
+    Add a bed-configuration note to a job instance as a JobAction.
+    Operandio's schema has no direct job.updateDescription mutation - notes
+    are added via the top-level createJobAction(input: JobActionInput!)
+    mutation, which requires a "job" ID and a "title", with the actual note
+    text going in "content".
+    """
     graphql(token, """
-        mutation UpdateJobDescription($jobId: ID!, $description: String!) {
-            job(id: $jobId) {
-                updateDescription(description: $description) {
-                    id
-                    description
-                }
+        mutation CreateJobAction($jobId: ID!, $content: String!) {
+            createJobAction(input: { job: $jobId, title: "Bed Configuration Note", content: $content }) {
+                id
+                title
+                content
             }
         }
-    """, {"jobId": job_id, "description": description})
-    logger.info(f"Set job description: '{description}'")
+    """, {"jobId": job_id, "content": description})
+    logger.info(f"Set job note: '{description}'")
 
 
 def create_flip_checkout_job(token, cabin_config, date_str, guest_name="", bed_note=None):
