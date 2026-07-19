@@ -813,7 +813,7 @@ def debug_probe_description_field_endpoint():
             graphql(token, query, {"jobId": job_id, "value": test_value})
             results[fragment] = "SUCCESS"
         except Exception as e:
-            results[fragment] = str(e)[:250]
+            results[fragment] = str(e)
 
     return jsonify({"job_id": job_id, "results": results})
 
