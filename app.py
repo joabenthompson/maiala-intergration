@@ -759,6 +759,67 @@ def debug_future_endpoint():
     })
 
 
+DESCRIPTION_FIELD_CANDIDATES = {
+    "updateNotes": "notes",
+    "updateNote": "note",
+    "updateInstructions": "instructions",
+    "updateComment": "comment",
+    "updateComments": "comments",
+    "updateDetails": "details",
+    "updateBody": "body",
+    "updateText": "text",
+    "updateSummary": "summary",
+    "setDescription": "description",
+    "setNotes": "notes",
+}
+
+
+@app.route("/debug-probe-description-field", methods=["POST"])
+def debug_probe_description_field_endpoint():
+    """
+    Temporary diagnostic: tries a fixed whitelist of likely job-description
+    field names against Operandio's real JobMutation type (introspection is
+    disabled in prod, so we can't just ask). Reports which ones the schema
+    accepts, without needing a redeploy per guess.
+    Usage: POST /debug-probe-description-field?job_id=<real job id>
+    Header: X-Cron-Secret: <secret>
+    """
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return jsonify({"error": "job_id required (use an existing test job's id)"}), 400
+
+    test_value = "PROBE - please ignore"
+    results = {}
+    try:
+        token = get_operandio_token()
+    except Exception as e:
+        return jsonify({"error": f"auth failed: {e}"}), 500
+
+    for field, arg in DESCRIPTION_FIELD_CANDIDATES.items():
+        query = f"""
+            mutation Probe($jobId: ID!, $value: String!) {{
+                job(id: $jobId) {{
+                    {field}({arg}: $value) {{
+                        id
+                    }}
+                }}
+            }}
+        """
+        try:
+            graphql(token, query, {"jobId": job_id, "value": test_value})
+            results[field] = "SUCCESS"
+        except Exception as e:
+            msg = str(e)
+            results[field] = msg[:200]
+
+    return jsonify({"job_id": job_id, "results": results})
+
+
 @app.route("/debug-schema", methods=["GET"])
 def debug_schema_endpoint():
     """
