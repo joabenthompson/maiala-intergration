@@ -747,27 +747,14 @@ def debug_future_endpoint():
     })
 
 
-CHECKFRONT_PATH_CANDIDATES = [
-    "item/{id}/child",
-    "item/{id}/children",
-    "item/{id}/addon",
-    "item/{id}/addons",
-    "item/{id}/package",
-    "item/{id}/packages",
-    "item/{id}/option",
-    "item/{id}/options",
-    "item/{id}/rate",
-    "item/{id}/category",
-]
-
-
-@app.route("/debug-probe-item-children", methods=["GET"])
-def debug_probe_item_children_endpoint():
+@app.route("/debug-item-sweep", methods=["GET"])
+def debug_item_sweep_endpoint():
     """
-    Temporary read-only diagnostic: tries a whitelist of likely Checkfront REST
-    paths for a parent item's nested child items (bed configs, trundle beds
-    etc.), since the standard /item listing only returns top-level items.
-    Usage: /debug-probe-item-children?item_id=13
+    Temporary read-only diagnostic: fetches every item ID in a range directly
+    (GET /item/{id}), since the standard /item listing only returns top-level
+    items and hides children like per-cabin bed-config add-ons. Skips IDs that
+    don't resolve. Gives a full room-config schema picture in one call.
+    Usage: /debug-item-sweep?start=1&end=110
     Header: X-Cron-Secret: <secret>
     """
     if CRON_SECRET:
@@ -775,27 +762,42 @@ def debug_probe_item_children_endpoint():
         if auth != CRON_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
 
-    item_id = request.args.get("item_id")
-    if not item_id:
-        return jsonify({"error": "item_id required"}), 400
+    try:
+        start = int(request.args.get("start", 1))
+        end = int(request.args.get("end", 100))
+    except ValueError:
+        return jsonify({"error": "start/end must be integers"}), 400
+    if end - start > 200:
+        return jsonify({"error": "range too large, max 200 IDs per call"}), 400
 
-    results = {}
-    for path_template in CHECKFRONT_PATH_CANDIDATES:
-        path = path_template.format(id=item_id)
+    found = []
+    for item_id in range(start, end + 1):
         try:
             response = requests.get(
-                f"{CHECKFRONT_BASE_URL}/{path}",
+                f"{CHECKFRONT_BASE_URL}/item/{item_id}",
                 auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
                 timeout=15
             )
-            if response.status_code == 200:
-                results[path] = {"status": 200, "body": response.json()}
-            else:
-                results[path] = {"status": response.status_code, "body": response.text[:300]}
+            if response.status_code != 200:
+                continue
+            data = response.json()
+            item = data.get("item")
+            if not item:
+                continue
+            found.append({
+                "id": item.get("item_id"),
+                "name": item.get("name"),
+                "sku": item.get("sku"),
+                "category": item.get("category"),
+                "category_id": item.get("category_id"),
+                "status": item.get("status"),
+                "type": item.get("type"),
+                "rules": item.get("rules"),
+            })
         except Exception as e:
-            results[path] = {"error": str(e)}
+            found.append({"id": item_id, "error": str(e)})
 
-    return jsonify({"item_id": item_id, "results": results})
+    return jsonify({"start": start, "end": end, "count": len(found), "items": found})
 
 
 @app.route("/debug-booking-items", methods=["GET"])
