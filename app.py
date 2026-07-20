@@ -40,7 +40,8 @@ AEST = ZoneInfo("Australia/Brisbane")
 # Bookings with these statuses are considered active
 # PAID = fully paid, PART = deposit paid, HOLD = on hold, PEND = pending
 # OTACC = OTA takes payment, OTAPP = OTA pending payment
-ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND", "OTACC", "OTAPP", "OTAAB"}
+# REDB = Red Balloon (voucher/experience reseller channel)
+ACTIVE_STATUSES = {"PAID", "PART", "HOLD", "PEND", "OTACC", "OTAPP", "OTAAB", "REDB"}
 
 # Map cabin names (lowercase) to Operandio process + schedule IDs
 CABIN_MAP = {
