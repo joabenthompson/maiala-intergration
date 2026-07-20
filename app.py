@@ -281,9 +281,11 @@ def _parse_checkfront_date(raw):
 
 def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
     """
-    Look up the next active booking for cabin_config after checkout_date_str.
-    If it includes a 'Twin Share Configuration' add-on, return the appropriate
-    bed note string. Returns None if no note is needed.
+    Look up the next active booking for cabin_config after checkout_date_str
+    and return a note for the job title: always the next booking's check-in
+    date, plus bed-split instructions if that booking has a 'Twin Share
+    Configuration' add-on. Returns None only if there's no confirmed future
+    booking at all.
 
     Checkfront's booking list API does not return stay dates, so full detail is
     fetched for each candidate to find the actual earliest check-in after checkout.
@@ -328,6 +330,9 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
         f"Next booking for {cabin_config['label']}: check-in {next_checkin_date.date()}"
     )
 
+    days_until = (next_checkin_date - checkout_date).days
+    checkin_label = next_checkin_date.strftime("%d/%m/%Y")
+
     # Twin share add-ons appear in the list-level booking summary but NOT in the
     # detail's items dict (which only contains cabin/package line items). Use the
     # list-level summary that was already returned by the future bookings query,
@@ -335,16 +340,12 @@ def get_bed_note_for_next_booking(cabin_config, checkout_date_str):
     # "Main House" twin share doesn't incorrectly trigger a note for Bowerbird.
     list_summary = extract_cabin_summary(next_booking)
     if not has_twin_share_for_cabin(list_summary, cabin_config["label"]):
-        logger.info(f"No applicable twin share configuration for next {cabin_config['label']} booking")
-        return None
-
-    days_until = (next_checkin_date - checkout_date).days
-    checkin_label = next_checkin_date.strftime("%d/%m/%Y")
+        return f"Next booking {checkin_label}"
 
     if days_until <= 5:
-        return f"Split beds required - {checkin_label}"
+        return f"Split beds required next booking {checkin_label}"
     else:
-        return f"Do not make beds, split beds required - {checkin_label}"
+        return f"Split beds required {checkin_label} - strip bed and leave unmade"
 
 
 # ---------------------------------------------------------------------------
