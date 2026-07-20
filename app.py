@@ -798,6 +798,35 @@ def debug_probe_item_children_endpoint():
     return jsonify({"item_id": item_id, "results": results})
 
 
+@app.route("/debug-booking-items", methods=["GET"])
+def debug_booking_items_endpoint():
+    """
+    Temporary diagnostic: returns ONLY the line-item dict for a booking
+    (no customer name/email/phone/address) to find exact item IDs/SKUs for
+    add-ons like per-cabin twin share items that don't show up in /item.
+    Usage: /debug-booking-items?booking_id=1419
+    Header: X-Cron-Secret: <secret>
+    """
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    booking_id = request.args.get("booking_id")
+    if not booking_id:
+        return jsonify({"error": "booking_id required"}), 400
+    try:
+        detail = get_checkfront_booking_detail(booking_id)
+        return jsonify({
+            "booking_id": booking_id,
+            "start_date": detail.get("start_date"),
+            "end_date": detail.get("end_date"),
+            "items": detail.get("items", {})
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/debug-create-test-job", methods=["POST"])
 def debug_create_test_job_endpoint():
     """
