@@ -747,6 +747,57 @@ def debug_future_endpoint():
     })
 
 
+CHECKFRONT_PATH_CANDIDATES = [
+    "item/{id}/child",
+    "item/{id}/children",
+    "item/{id}/addon",
+    "item/{id}/addons",
+    "item/{id}/package",
+    "item/{id}/packages",
+    "item/{id}/option",
+    "item/{id}/options",
+    "item/{id}/rate",
+    "item/{id}/category",
+]
+
+
+@app.route("/debug-probe-item-children", methods=["GET"])
+def debug_probe_item_children_endpoint():
+    """
+    Temporary read-only diagnostic: tries a whitelist of likely Checkfront REST
+    paths for a parent item's nested child items (bed configs, trundle beds
+    etc.), since the standard /item listing only returns top-level items.
+    Usage: /debug-probe-item-children?item_id=13
+    Header: X-Cron-Secret: <secret>
+    """
+    if CRON_SECRET:
+        auth = request.headers.get("X-Cron-Secret", "")
+        if auth != CRON_SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+    item_id = request.args.get("item_id")
+    if not item_id:
+        return jsonify({"error": "item_id required"}), 400
+
+    results = {}
+    for path_template in CHECKFRONT_PATH_CANDIDATES:
+        path = path_template.format(id=item_id)
+        try:
+            response = requests.get(
+                f"{CHECKFRONT_BASE_URL}/{path}",
+                auth=(CHECKFRONT_API_KEY, CHECKFRONT_API_SECRET),
+                timeout=15
+            )
+            if response.status_code == 200:
+                results[path] = {"status": 200, "body": response.json()}
+            else:
+                results[path] = {"status": response.status_code, "body": response.text[:300]}
+        except Exception as e:
+            results[path] = {"error": str(e)}
+
+    return jsonify({"item_id": item_id, "results": results})
+
+
 @app.route("/debug-create-test-job", methods=["POST"])
 def debug_create_test_job_endpoint():
     """
